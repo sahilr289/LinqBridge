@@ -174,6 +174,18 @@ async function safeText(res) {
   try { return await res.text(); } catch { return ""; }
 }
 
+// --- Helper: derive a public URL from Sales Navigator URL (heuristic fallback) ---
+function derivePublicFromSalesNav(salesNavUrl) {
+  if (!salesNavUrl) return null;
+  // Try to extract the first token after /sales/lead/
+  // e.g. /sales/lead/ACwAA... -> /in/ACwAA...
+  const m = salesNavUrl.match(/\/sales\/lead\/([^,\/\?]+)/i);
+  if (m && m[1]) {
+    return `https://www.linkedin.com/in/${m[1]}`;
+  }
+  return null;
+}
+
 // ---------- Auth ----------
 function authenticateToken(req, res, next) {
   const auth = req.headers["authorization"];
@@ -313,7 +325,7 @@ app.post("/upload-leads", async (req, res) => {
         ? rawLead.public_linkedin_url
         : null;
 
-      const salesNavUrl =
+      let salesNavUrl =
         (rawLead.sales_nav_url && rawLead.sales_nav_url !== "N/A")
           ? rawLead.sales_nav_url
           : (rawLead.profile_url || null); // some extensions use profile_url for SN URL
@@ -330,8 +342,20 @@ app.post("/upload-leads", async (req, res) => {
         }
       }
 
+      // NEW: if we still don't have a public URL, try to derive it from Sales Nav (heuristic fallback)
+      let inferredPublic = null;
+      if (!publicUrl && salesNavUrl && salesNavUrl.includes('/sales/lead/')) {
+        inferredPublic = derivePublicFromSalesNav(salesNavUrl);
+        if (inferredPublic) {
+          console.log(`[Heuristic] Derived public URL for #${index + 1}: ${inferredPublic}`);
+        }
+      }
+
+      // choose what to store in public_profile_url
+      const public_profile_url_to_store = publicUrl || inferredPublic || null;
+
       // If we still have neither, we'll still store the SalesNav URL — automation worker will use COALESCE(public_profile_url, profile_url)
-      if (!publicUrl && !profileUrlLegacy && !salesNavUrl) {
+      if (!public_profile_url_to_store && !profileUrlLegacy && !salesNavUrl) {
         console.warn(`[Data Warning] Skipping lead ${index + 1} (no URL fields at all): ${fullName}`);
         skipped++;
         return;
@@ -341,9 +365,9 @@ app.post("/upload-leads", async (req, res) => {
         userEmail,
         firstName,
         lastName,
-        profileUrlLegacy,               // legacy/generic
-        publicUrl,                      // resolved public /in/ URL (preferred)
-        salesNavUrl,                    // keep the Sales Navigator URL too
+        profileUrlLegacy,               // profile_url (legacy)
+        public_profile_url_to_store,    // public_profile_url (preferred)
+        salesNavUrl,                    // sales_nav_url
         organization,
         title,
         timestamp || new Date().toISOString(),
