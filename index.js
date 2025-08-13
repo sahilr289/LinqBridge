@@ -102,6 +102,78 @@ function initializeDatabase() {
 }
 initializeDatabase();
 
+// --- Helper: get the latest li_at for a user (from /store-cookies) ---
+function getLatestLiAtForUser(email) {
+  try {
+    const row = db
+      .prepare("SELECT li_at FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1")
+      .get(email);
+    return row?.li_at || null;
+  } catch (e) {
+    console.error("getLatestLiAtForUser error:", e);
+    return null;
+  }
+}
+
+// --- Helper: pull fs_salesProfile ID from a Sales Navigator URL ---
+function extractFsSalesProfileId(salesNavUrl = "") {
+  // matches ...fs_salesProfile:12345678 OR urn:li:fs_salesProfile:(12345678)
+  const m =
+    salesNavUrl.match(/fs_salesProfile:(\d+)/) ||
+    salesNavUrl.match(/fs_salesProfile:\((\d+)\)/);
+  return m ? m[1] : null;
+}
+
+// --- Helper: resolve Sales Nav → public /in/ URL using LinkedIn sales-api (requires li_at) ---
+async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
+  if (!salesNavUrl || !liAtCookie) return null;
+  const profileId = extractFsSalesProfileId(salesNavUrl);
+  if (!profileId) return null;
+
+  const apiUrl = `https://www.linkedin.com/sales-api/salesApiProfiles/${profileId}`;
+
+  try {
+    const res = await fetch(apiUrl, {
+      method: "GET",
+      // Minimal headers. We send li_at as cookie. csrf-token is often required but value is not strictly validated.
+      headers: {
+        "accept": "application/json",
+        "x-restli-protocol-version": "2.0.0",
+        "csrf-token": "ajax:123456789",
+        "cookie": `li_at=${liAtCookie};`
+      },
+      // reasonable timeout via AbortController pattern
+      signal: AbortSignal.timeout ? AbortSignal.timeout(12_000) : undefined
+    });
+
+    if (!res.ok) {
+      console.warn("resolveSalesNavToPublicUrl non-OK:", res.status, await safeText(res));
+      return null;
+    }
+
+    const data = await res.json().catch(() => ({}));
+    // Common spots where public URL appears (this can vary)
+    const candidates = [
+      data?.profile?.profileUrl,
+      data?.profile?.profileUrn,        // sometimes points to /in/
+      data?.publicProfileUrl,
+      data?.profile?.publicIdentifier   // sometimes just the slug
+        ? `https://www.linkedin.com/in/${data.profile.publicIdentifier}`
+        : null
+    ].filter(Boolean);
+
+    return candidates[0] || null;
+  } catch (e) {
+    console.error("resolveSalesNavToPublicUrl error:", e);
+    return null;
+  }
+}
+
+// Tiny helper so we can log text body safely on non-OK responses
+async function safeText(res) {
+  try { return await res.text(); } catch { return ""; }
+}
+
 // ---------- Auth ----------
 function authenticateToken(req, res, next) {
   const auth = req.headers["authorization"];
@@ -199,12 +271,18 @@ app.get("/api/me/liat", authenticateToken, (req, res) => {
   }
 });
 
-// ---------- Upload leads from extension ----------
+// ---------- Upload leads from extension (with SalesNav → public URL resolution) ----------
 app.post("/upload-leads", async (req, res) => {
   console.log("Received /upload-leads");
   const { leads, userEmail, timestamp } = req.body || {};
   if (!userEmail || !Array.isArray(leads) || leads.length === 0) {
     return res.status(400).json({ success: false, message: "Missing userEmail or leads." });
+  }
+
+  // get li_at for this user (if they clicked "Capture cookies" in the extension)
+  const liAt = getLatestLiAtForUser(userEmail);
+  if (!liAt) {
+    console.warn("[upload-leads] No li_at stored for", userEmail, "- will save Sales Nav URLs as-is.");
   }
 
   const insertLeadSql = `
@@ -217,65 +295,90 @@ app.post("/upload-leads", async (req, res) => {
 
   let inserted = 0, skipped = 0;
 
-  try {
-    db.transaction(() => {
-      for (let i = 0; i < leads.length; i++) {
-        const lead = leads[i] || {};
-        const fullName = lead.full_name || "";
-        const firstName = lead.first_name || null;
-        const lastName  = lead.last_name || null;
-        const organization = lead.company || null;
-        const title = lead.title || null;
+  // Resolve a few leads concurrently but not too many at once (to be gentle)
+  const CONCURRENCY = 4;
+  const queue = [...leads];
+  const workers = [];
 
-        const publicUrl = lead.public_linkedin_url && lead.public_linkedin_url !== "N/A"
-          ? lead.public_linkedin_url
-          : null;
+  async function processOne(rawLead, index) {
+    try {
+      const fullName = rawLead.full_name || "";
+      const firstName = rawLead.first_name || null;
+      const lastName  = rawLead.last_name || null;
+      const organization = rawLead.company || null;
+      const title = rawLead.title || null;
 
-        const salesNavUrl = lead.sales_nav_url && lead.sales_nav_url !== "N/A"
-          ? lead.sales_nav_url
-          : (lead.profile_url || null); // some extensions call this profile_url
+      // incoming fields from your extension
+      let publicUrl = (rawLead.public_linkedin_url && rawLead.public_linkedin_url !== "N/A")
+        ? rawLead.public_linkedin_url
+        : null;
 
-        const profileUrlLegacy = lead.profile_url || null; // keep for backward compat
+      const salesNavUrl =
+        (rawLead.sales_nav_url && rawLead.sales_nav_url !== "N/A")
+          ? rawLead.sales_nav_url
+          : (rawLead.profile_url || null); // some extensions use profile_url for SN URL
 
-        if (!publicUrl && !profileUrlLegacy) {
-          console.warn(`[Data Warning] Skipping lead ${i + 1} (no URL): ${fullName}`);
-          skipped++;
-          continue;
-        }
+      const profileUrlLegacy = rawLead.profile_url || null;
 
-        const info = insertStmt.run(
-          userEmail,
-          firstName,
-          lastName,
-          profileUrlLegacy,
-          publicUrl,
-          salesNavUrl,
-          organization,
-          title,
-          timestamp || new Date().toISOString(),
-          "scraped"
-        );
-
-        if (info.changes > 0) {
-          inserted++;
+      // If we don't have a public URL yet, try to resolve from Sales Nav using li_at
+      if (!publicUrl && salesNavUrl && liAt) {
+        publicUrl = await resolveSalesNavToPublicUrl(salesNavUrl, liAt);
+        if (publicUrl) {
+          console.log(`[Resolver] Resolved public URL for #${index + 1}: ${publicUrl}`);
         } else {
-          skipped++;
+          console.warn(`[Resolver] Could not resolve public URL for #${index + 1} (${fullName}).`);
         }
       }
-    })();
 
-    return res.status(200).json({
-      success: true,
-      message: "Leads processed and saved successfully!",
-      received: leads.length,
-      inserted,
-      skipped_duplicates: skipped,
-      user_email: userEmail,
-    });
-  } catch (e) {
-    console.error("upload-leads error:", e);
-    return res.status(500).json({ success: false, message: "Internal server error during lead processing." });
+      // If we still have neither, we'll still store the SalesNav URL — automation worker will use COALESCE(public_profile_url, profile_url)
+      if (!publicUrl && !profileUrlLegacy && !salesNavUrl) {
+        console.warn(`[Data Warning] Skipping lead ${index + 1} (no URL fields at all): ${fullName}`);
+        skipped++;
+        return;
+      }
+
+      const info = insertStmt.run(
+        userEmail,
+        firstName,
+        lastName,
+        profileUrlLegacy,               // legacy/generic
+        publicUrl,                      // resolved public /in/ URL (preferred)
+        salesNavUrl,                    // keep the Sales Navigator URL too
+        organization,
+        title,
+        timestamp || new Date().toISOString(),
+        "scraped"
+      );
+
+      if (info.changes > 0) inserted++; else skipped++;
+    } catch (e) {
+      console.error(`Lead #${index + 1} insert error:`, e.message);
+      skipped++;
+    }
   }
+
+  // simple concurrency scheduler
+  for (let w = 0; w < Math.min(CONCURRENCY, queue.length); w++) {
+    workers.push(
+      (async function runWorker() {
+        while (queue.length) {
+          const idx = leads.length - queue.length; // nice-ish index
+          const next = queue.shift();
+          await processOne(next, idx);
+        }
+      })()
+    );
+  }
+  await Promise.all(workers);
+
+  return res.status(200).json({
+    success: true,
+    message: "Leads processed and saved successfully!",
+    received: leads.length,
+    inserted,
+    skipped_duplicates: skipped,
+    user_email: userEmail,
+  });
 });
 
 // ---------- Dashboard (protected) ----------
