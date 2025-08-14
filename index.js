@@ -454,20 +454,40 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
     const { profileUrl, note = null, priority = 3 } = req.body || {};
     if (!profileUrl) return res.status(400).json({ error: "profileUrl required" });
 
-    const row = db.prepare("SELECT li_at FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1").get(email);
+    const row = db.prepare(
+      "SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1"
+    ).get(email);
+
     if (!row?.li_at) return res.status(404).json({ error: "No li_at stored. Capture cookies first." });
 
     const d = await readJobs();
     const job = {
       id: uuidv4(),
       type: "SEND_CONNECTION",
-      payload: { profileUrl, note, cookieBundle: { li_at: row.li_at } },
-      priority, status: "queued", enqueuedAt: new Date().toISOString(),
-      attempts: 0, lastError: null
+      payload: {
+        profileUrl,
+        note,
+        cookieBundle: {
+          li_at: row.li_at,
+          jsessionid: row.jsessionid || null,
+          bcookie: row.bcookie || null
+        }
+      },
+      priority,
+      status: "queued",
+      enqueuedAt: new Date().toISOString(),
+      attempts: 0,
+      lastError: null
     };
-    d.queued.push(job); d.queued.sort((a,b)=>a.priority-b.priority); await writeJobs(d);
-    res.json({ ok:true, job });
-  } catch (e) { console.error(e); res.status(500).json({ error:"Failed to enqueue" }); }
+    d.queued.push(job);
+    d.queued.sort((a,b)=>a.priority-b.priority);
+    await writeJobs(d);
+
+    res.json({ ok: true, job });
+  } catch (e) {
+    console.error("enqueue-send-connection error:", e);
+    res.status(500).json({ error: "Failed to enqueue" });
+  }
 });
 
 // ---------- Upload leads from extension (with SalesNav → public URL resolution) ----------
