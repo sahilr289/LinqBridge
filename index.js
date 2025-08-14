@@ -447,6 +447,29 @@ app.get("/api/me/liat", authenticateToken, (req, res) => {
   }
 });
 
+// PROTECTED: enqueue SEND_CONNECTION using the latest stored li_at for the logged-in user
+app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+    const { profileUrl, note = null, priority = 3 } = req.body || {};
+    if (!profileUrl) return res.status(400).json({ error: "profileUrl required" });
+
+    const row = db.prepare("SELECT li_at FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1").get(email);
+    if (!row?.li_at) return res.status(404).json({ error: "No li_at stored. Capture cookies first." });
+
+    const d = await readJobs();
+    const job = {
+      id: uuidv4(),
+      type: "SEND_CONNECTION",
+      payload: { profileUrl, note, cookieBundle: { li_at: row.li_at } },
+      priority, status: "queued", enqueuedAt: new Date().toISOString(),
+      attempts: 0, lastError: null
+    };
+    d.queued.push(job); d.queued.sort((a,b)=>a.priority-b.priority); await writeJobs(d);
+    res.json({ ok:true, job });
+  } catch (e) { console.error(e); res.status(500).json({ error:"Failed to enqueue" }); }
+});
+
 // ---------- Upload leads from extension (with SalesNav → public URL resolution) ----------
 app.post("/upload-leads", async (req, res) => {
   console.log("Received /upload-leads");
