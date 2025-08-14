@@ -8,9 +8,36 @@ const ExcelJS = require("exceljs");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 
+// --- Job Queue (file-backed) ---
+const fs = require("fs-extra");
+const { v4: uuidv4 } = require("uuid");
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key";
+
+const DATA_DIR  = path.join(__dirname, "data");
+const JOBS_FILE = path.join(DATA_DIR, "jobs.json");
+
+// init queue storage once at boot
+(async () => {
+  await fs.ensureDir(DATA_DIR);
+  if (!(await fs.pathExists(JOBS_FILE))) {
+    await fs.writeJson(JOBS_FILE, { queued: [], active: [], done: [], failed: [] }, { spaces: 2 });
+  }
+})();
+
+async function readJobs(){ return fs.readJson(JOBS_FILE); }
+async function writeJobs(d){ return fs.writeJson(JOBS_FILE, d, { spaces: 2 }); }
+
+// worker-only auth header
+function requireWorkerAuth(req, res, next) {
+  const header = req.get("x-worker-secret");
+  if (!header || header !== process.env.WORKER_SHARED_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
 
 // ---------- Middleware ----------
 app.use(express.json({ limit: "50mb" }));
@@ -247,6 +274,143 @@ app.post("/login", async (req, res) => {
       .status(500)
       .json({ success: false, message: "Internal server error during login." });
   }
+});
+
+// ---------- Job Queue Endpoints ----------
+// Public: enqueue a job
+app.post("/jobs", async (req, res) => {
+  try {
+    const { type, payload, priority = 5 } = req.body || {};
+    if (!type) return res.status(400).json({ error: "Missing job 'type'." });
+
+    const job = {
+      id: uuidv4(),
+      type,                      // e.g., "SEND_CONNECTION"
+      payload: payload || {},
+      priority,                  // 1(high)–9(low)
+      status: "queued",
+      enqueuedAt: new Date().toISOString(),
+      attempts: 0,
+      lastError: null,
+    };
+
+    const d = await readJobs();
+    d.queued.push(job);
+    d.queued.sort((a,b) => a.priority - b.priority);
+    await writeJobs(d);
+
+    res.json({ ok: true, job });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to enqueue." });
+  }
+});
+
+// Worker: pull next job
+app.post("/jobs/next", requireWorkerAuth, async (req, res) => {
+  try {
+    const { types } = req.body || {};
+    const d = await readJobs();
+
+    let idx = -1;
+    if (Array.isArray(types) && types.length) {
+      idx = d.queued.findIndex(j => types.includes(j.type));
+    } else {
+      idx = d.queued.length ? 0 : -1;
+    }
+
+    if (idx === -1) return res.json({ ok: true, job: null });
+
+    const job = d.queued.splice(idx, 1)[0];
+    job.status = "active";
+    job.attempts += 1;
+    job.startedAt = new Date().toISOString();
+    d.active.push(job);
+    await writeJobs(d);
+
+    res.json({ ok: true, job });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to fetch next job." });
+  }
+});
+
+// Worker: complete job
+app.post("/jobs/:id/complete", requireWorkerAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { result } = req.body || {};
+    const d = await readJobs();
+
+    const i = d.active.findIndex(j => j.id === id);
+    if (i === -1) return res.status(404).json({ error: "Active job not found" });
+
+    const job = d.active.splice(i, 1)[0];
+    job.status = "done";
+    job.completedAt = new Date().toISOString();
+    job.result = result ?? null;
+    d.done.push(job);
+    await writeJobs(d);
+
+    res.json({ ok: true, job });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to complete job." });
+  }
+});
+
+// Worker: fail job (optional requeue)
+app.post("/jobs/:id/fail", requireWorkerAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error, requeue = false, delayMs = 0 } = req.body || {};
+    const d = await readJobs();
+
+    const i = d.active.findIndex(j => j.id === id);
+    if (i === -1) return res.status(404).json({ error: "Active job not found" });
+
+    const job = d.active.splice(i, 1)[0];
+    job.status = "failed";
+    job.lastError = error || "Unknown";
+    job.failedAt = new Date().toISOString();
+
+    if (requeue) {
+      job.status = "queued";
+      delete job.startedAt;
+      if (delayMs > 0) {
+        setTimeout(async () => {
+          const d2 = await readJobs();
+          d2.queued.push(job);
+          d2.queued.sort((a,b)=>a.priority-b.priority);
+          await writeJobs(d2);
+        }, delayMs);
+      } else {
+        d.queued.push(job);
+        d.queued.sort((a,b)=>a.priority-b.priority);
+      }
+    } else {
+      d.failed.push(job);
+    }
+
+    await writeJobs(d);
+    res.json({ ok: true, job });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to fail job." });
+  }
+});
+
+// Dev: queue stats
+app.get("/jobs/stats", async (_req, res) => {
+  const d = await readJobs();
+  res.json({
+    counts: {
+      queued: d.queued.length,
+      active: d.active.length,
+      done:   d.done.length,
+      failed: d.failed.length,
+    },
+  });
 });
 
 // ---------- Cookies from extension ----------
