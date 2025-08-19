@@ -6,6 +6,16 @@
   --muted: #777;
   --border: #e5e7eb;
   --danger: #e11d48;
+
+  /* extras */
+  --ok-bg: #d1fae5;
+  --ok-text: #065f46;
+  --fail-bg: #fee2e2;
+  --fail-text: #7f1d1d;
+  --info-bg: #e0e7ff;
+  --info-text: #1e3a8a;
+  --warn-bg: #fff7ed;
+  --warn-text: #9a3412;
 }
 
 * { box-sizing: border-box; }
@@ -26,7 +36,8 @@ h1 { color: var(--brand); margin: 0 0 16px; }
   box-shadow: 0 1px 2px rgba(0,0,0,.03);
 }
 
-.tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+/* Tabs (auth + app) */
+.tabs, .app-tabs { display: flex; gap: 8px; margin-bottom: 12px; }
 .tab {
   border: 1px solid var(--border);
   background: #fff;
@@ -36,30 +47,71 @@ h1 { color: var(--brand); margin: 0 0 16px; }
 }
 .tab.active { background: var(--brand); color: #fff; border-color: var(--brand); }
 
+/* Forms */
 .form { display: none; gap: 8px; }
 .form-active { display: grid; }
 .form input {
   padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px;
 }
+
+/* Buttons */
 .btn {
   padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border); background: #fff;
   cursor: pointer;
 }
 .btn.primary { background: var(--brand); color: #fff; border-color: var(--brand); }
 .btn.danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+.btn:disabled { opacity: .6; cursor: not-allowed; }
 
+/* Toolbars */
 .toolbar {
   display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px;
 }
 .toolbar .right { display: flex; align-items: center; gap: 12px; }
 #whoami { color: var(--muted); }
 
-#leads-table { width: 100%; border-collapse: collapse; }
-#leads-table th, #leads-table td { border: 1px solid var(--border); padding: 8px; text-align: left; }
-#leads-table th { background: #f3f4f6; }
+/* Views inside app */
+.app-view { display: none; }
+.app-view.view-active { display: block; }
 
-.msg {
-  margin-top: 8px; padding: 10px 12px; border-radius: 8px; background: #eef6ff; color: #084c8c;
-  border: 1px solid #b6daff;
+/* Sections in connection tab */
+.section { margin: 10px 0 18px; }
+.section h3 { margin: 0 0 6px; }
+
+/* Badge for connection status */
+.badge {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #eee;
+  color: #333;
+  font-size: 12px;
+  border: 1px solid var(--border);
 }
-.msg.error { background: #fee2e2; color: #7f1d1d; border-color: #fecaca; }
+.badge.ok   { background: var(--ok-bg);   color: var(--ok-text);   border-color: #a7f3d0; }
+.badge.fail { background: var(--fail-bg); color: var(--fail-text); border-color: #fecaca; }
+
+/* Messages */
+.msg {
+  margin-top: 8px; padding: 10px 12px; border-radius: 8px;
+  background: #eef6ff; color: #084c8c; border: 1px solid #b6daff;
+}
+.msg.error   { background: var(--fail-bg); color: var(--fail-text); border-color: #fecaca; }
+.msg.success { background: var(--ok-bg);   color: var(--ok-text);   border-color: #a7f3d0; }
+.msg.info    { background: var(--info-bg); color: var(--info-text); border-color: #c7d2fe; }
+.msg.warning { background: var(--warn-bg); color: var(--warn-text); border-color: #fed7aa; }
+
+/* Tables (reused for leads & logs) */
+table { width: 100%; border-collapse: collapse; }
+#leads-table th, #leads-table td,
+#logs-table th,  #logs-table td {
+  border: 1px solid var(--border); padding: 8px; text-align: left; vertical-align: top;
+}
+#leads-table th, #logs-table th { background: #f3f4f6; }
+
+/* Responsive tweaks */
+@media (max-width: 720px) {
+  .toolbar { flex-direction: column; align-items: stretch; gap: 8px; }
+  .tabs, .app-tabs { flex-wrap: wrap; }
+  table { font-size: 14px; }
+}
