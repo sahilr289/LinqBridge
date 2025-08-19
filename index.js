@@ -1,4 +1,4 @@
-// index.js — LinqBridge backend (Auth + Leads + Automation) + Connection Status
+// index.js — LinqBridge backend (Auth + Leads + Automation + Connection Check) FINAL
 
 // --- Core Modules ---
 const express = require("express");
@@ -8,33 +8,35 @@ const path = require("path");
 const ExcelJS = require("exceljs");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const fs = require("fs-extra"); // File-system helper
-const { v4: uuidv4 } = require("uuid"); // For unique job IDs
-require("dotenv").config(); // IMPORTANT: Load environment variables from .env file
+const fs = require("fs-extra");
+const { v4: uuidv4 } = require("uuid");
+require("dotenv").config(); // load .env if present
 
 // --- Server Setup ---
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// SECURITY: Use environment variable for JWT secret. The fallback is for local dev only.
+// SECURITY: set JWT_SECRET in env for prod
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key_change_this_for_prod";
 
 // --- Job Queue (file-backed) ---
 const DATA_DIR = path.join(__dirname, "data");
 const JOBS_FILE = path.join(DATA_DIR, "jobs.json");
 
-// Initializes queue storage on boot.
 (async () => {
   await fs.ensureDir(DATA_DIR);
   if (!(await fs.pathExists(JOBS_FILE))) {
-    await fs.writeJson(JOBS_FILE, { queued: [], active: [], done: [], failed: [] }, { spaces: 2 });
+    await fs.writeJson(
+      JOBS_FILE,
+      { queued: [], active: [], done: [], failed: [] },
+      { spaces: 2 }
+    );
   }
 })();
-
 async function readJobs() { return fs.readJson(JOBS_FILE); }
 async function writeJobs(d) { return fs.writeJson(JOBS_FILE, d, { spaces: 2 }); }
 
-// Worker-only authentication middleware.
+// Worker-only auth header
 function requireWorkerAuth(req, res, next) {
   const header = req.get("x-worker-secret");
   if (!header || header !== process.env.WORKER_SHARED_SECRET) {
@@ -47,7 +49,7 @@ function requireWorkerAuth(req, res, next) {
 app.use(express.json({ limit: "50mb" }));
 app.use(express.static("public"));
 
-// CORS: allow specific origins for security.
+// CORS: allow specific origins (extension + Railway domain); allow no-origin (same-origin, curl)
 const ALLOWED_ORIGINS = [
   "chrome-extension://mhfjpfanjgflnflifenhoejbfjecleen",
   "http://localhost:3000",
@@ -123,38 +125,35 @@ function initializeDatabase() {
     );
   `);
 
-  // NEW: connection logs table
+  // NEW: connection logs
   db.exec(`
     CREATE TABLE IF NOT EXISTS connection_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_email TEXT NOT NULL,
-      level TEXT NOT NULL,           -- info | warn | error
-      event TEXT NOT NULL,           -- cookies_saved | status_ok | status_fail | ...
-      details TEXT,                  -- JSON/string
+      level TEXT NOT NULL,      -- info | warn | error
+      event TEXT NOT NULL,      -- e.g. cookies_saved | status_ok | status_fail
+      details TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
   `);
 
-  // Partial UNIQUE indexes enforce per-user uniqueness.
+  // Partial UNIQUE indexes (SQLite supports WHERE on indexes)
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_unique_public
     ON leads(user_email, public_profile_url)
     WHERE public_profile_url IS NOT NULL;
   `);
-
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_unique_legacy
     ON leads(user_email, profile_url)
     WHERE profile_url IS NOT NULL;
   `);
 
-  console.log(
-    "Database initialized: Leads, Message Templates, Users, Cookies, Connection Logs, and unique indexes ready."
-  );
+  console.log("Database initialized.");
 }
 initializeDatabase();
 
-// --- Helper Functions ---
+// --- Helpers ---
 function logConn(email, level, event, detailsObj) {
   try {
     const stmt = db.prepare(`
@@ -180,7 +179,7 @@ function getLatestLiAtForUser(email) {
   }
 }
 
-// Extracts Sales Navigator profile ID.
+// Extract Sales Navigator profile ID.
 function extractFsSalesProfileId(salesNavUrl = "") {
   const m =
     salesNavUrl.match(/fs_salesProfile:(\d+)/) ||
@@ -188,32 +187,29 @@ function extractFsSalesProfileId(salesNavUrl = "") {
   return m ? m[1] : null;
 }
 
-// Resolve Sales Nav URL → public URL (best-effort; LI may change this)
+// LinkedIn Sales API resolver (best-effort; may change any time).
 async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
   if (!salesNavUrl || !liAtCookie) return null;
   const profileId = extractFsSalesProfileId(salesNavUrl);
   if (!profileId) return null;
 
   const apiUrl = `https://www.linkedin.com/sales-api/salesApiProfiles/${profileId}`;
-
   try {
-    const res = await fetch(apiUrl, {
+    const resp = await fetch(apiUrl, {
       method: "GET",
       headers: {
-        "accept": "application/json",
+        accept: "application/json",
         "x-restli-protocol-version": "2.0.0",
         "csrf-token": "ajax:123456789",
-        "cookie": `li_at=${liAtCookie};`
+        cookie: `li_at=${liAtCookie};`
       },
       signal: AbortSignal.timeout ? AbortSignal.timeout(12_000) : undefined
     });
-
-    if (!res.ok) {
-      console.warn("resolveSalesNavToPublicUrl non-OK:", res.status, await safeText(res));
+    if (!resp.ok) {
+      console.warn("resolveSalesNavToPublicUrl non-OK:", resp.status, await safeText(resp));
       return null;
     }
-
-    const data = await res.json().catch(() => ({}));
+    const data = await resp.json().catch(() => ({}));
     const candidates = [
       data?.profile?.profileUrl,
       data?.profile?.profileUrn,
@@ -222,7 +218,6 @@ async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
         ? `https://www.linkedin.com/in/${data.profile.publicIdentifier}`
         : null
     ].filter(Boolean);
-
     return candidates[0] || null;
   } catch (e) {
     console.error("resolveSalesNavToPublicUrl error:", e);
@@ -230,18 +225,13 @@ async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
   }
 }
 
-// Tiny helper to safely read response body as text.
-async function safeText(res) {
-  try { return await res.text(); } catch { return ""; }
-}
+async function safeText(res) { try { return await res.text(); } catch { return ""; } }
 
-// Heuristic fallback for resolving Sales Nav to public URL.
+// Heuristic fallback for Sales Nav → public URL
 function derivePublicFromSalesNav(salesNavUrl) {
   if (!salesNavUrl) return null;
   const m = salesNavUrl.match(/\/sales\/lead\/([^,\/\?]+)/i);
-  if (m && m[1]) {
-    return `https://www.linkedin.com/in/${m[1]}`;
-  }
+  if (m && m[1]) return `https://www.linkedin.com/in/${m[1]}`;
   return null;
 }
 
@@ -261,37 +251,26 @@ function authenticateToken(req, res, next) {
 app.post("/register", async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {
-    return res
-      .status(400)
-      .json({ success: false, message: "Email and password are required." });
+    return res.status(400).json({ success: false, message: "Email and password are required." });
   }
   try {
     const hashed = await bcrypt.hash(password, 10);
-    const stmt = db.prepare("INSERT INTO users (email, password) VALUES (?, ?)");
-    const info = stmt.run(email, hashed);
+    const info = db.prepare("INSERT INTO users (email, password) VALUES (?, ?)").run(email, hashed);
     if (info.changes > 0) {
       console.log(`User registered: ${email}`);
-      return res
-        .status(201)
-        .json({ success: true, message: "User registered successfully." });
+      return res.status(201).json({ success: true, message: "User registered successfully." });
     }
-    return res
-      .status(409)
-      .json({ success: false, message: "User with this email already exists." });
+    return res.status(409).json({ success: false, message: "User already exists." });
   } catch (e) {
     console.error("Register error:", e);
-    return res
-      .status(500)
-      .json({ success: false, message: "Internal server error during registration." });
+    return res.status(500).json({ success: false, message: "Internal server error during registration." });
   }
 });
 
 app.post("/login", async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {
-    return res
-      .status(400)
-      .json({ success: false, message: "Email and password are required." });
+    return res.status(400).json({ success: false, message: "Email and password are required." });
   }
   try {
     const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
@@ -303,9 +282,7 @@ app.post("/login", async (req, res) => {
     return res.status(200).json({ success: true, message: "Logged in successfully.", token, userEmail: user.email });
   } catch (e) {
     console.error("Login error:", e);
-    return res
-      .status(500)
-      .json({ success: false, message: "Internal server error during login." });
+    return res.status(500).json({ success: false, message: "Internal server error during login." });
   }
 });
 
@@ -349,7 +326,6 @@ app.post("/jobs/next", requireWorkerAuth, async (req, res) => {
     } else {
       idx = d.queued.length ? 0 : -1;
     }
-
     if (idx === -1) return res.json({ ok: true, job: null });
 
     const job = d.queued.splice(idx, 1)[0];
@@ -448,10 +424,10 @@ app.post("/store-cookies", (req, res) => {
     if (!email || !cookies || !cookies.li_at) {
       return res.status(400).json({ success: false, message: "Missing email or li_at cookie." });
     }
-    const insertStmt = db.prepare(
+    const stmt = db.prepare(
       "INSERT INTO cookies (email, li_at, jsessionid, bcookie, timestamp) VALUES (?, ?, ?, ?, ?)"
     );
-    insertStmt.run(
+    stmt.run(
       email,
       cookies.li_at,
       cookies.JSESSIONID || null,
@@ -459,7 +435,7 @@ app.post("/store-cookies", (req, res) => {
       timestamp || new Date().toISOString()
     );
 
-    // NEW: log event
+    // log success
     logConn(email, "info", "cookies_saved", {
       has_li_at: !!cookies.li_at,
       has_jsessionid: !!cookies.JSESSIONID,
@@ -473,6 +449,7 @@ app.post("/store-cookies", (req, res) => {
   }
 });
 
+// Latest li_at for worker/use
 app.get("/api/me/liat", authenticateToken, (req, res) => {
   try {
     const row = db
@@ -488,6 +465,7 @@ app.get("/api/me/liat", authenticateToken, (req, res) => {
   }
 });
 
+// Enqueue SEND_CONNECTION (protected)
 app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
@@ -497,7 +475,6 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
     const row = db.prepare(
       "SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1"
     ).get(email);
-
     if (!row?.li_at) return res.status(404).json({ error: "No li_at stored. Capture cookies first." });
 
     const d = await readJobs();
@@ -530,7 +507,7 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
   }
 });
 
-// --- Lead Management Endpoints ---
+// --- Lead Management ---
 app.post("/upload-leads", async (req, res) => {
   console.log("Received /upload-leads");
   const { leads, userEmail, timestamp } = req.body || {};
@@ -543,13 +520,13 @@ app.post("/upload-leads", async (req, res) => {
     console.warn("[upload-leads] No li_at stored for", userEmail, "- will save Sales Nav URLs as-is.");
   }
 
-  const insertLeadSql = `
+  const sql = `
     INSERT OR IGNORE INTO leads
-    (user_email, first_name, last_name, profile_url, public_profile_url, sales_nav_url,
-      organization, title, timestamp, automation_status)
+      (user_email, first_name, last_name, profile_url, public_profile_url, sales_nav_url,
+       organization, title, timestamp, automation_status)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
   `;
-  const insertStmt = db.prepare(insertLeadSql);
+  const insertStmt = db.prepare(sql);
 
   let inserted = 0, skipped = 0;
 
@@ -561,7 +538,7 @@ app.post("/upload-leads", async (req, res) => {
     try {
       const fullName = rawLead.full_name || "";
       const firstName = rawLead.first_name || null;
-      const lastName = rawLead.last_name || null;
+      const lastName  = rawLead.last_name || null;
       const organization = rawLead.company || null;
       const title = rawLead.title || null;
 
@@ -586,7 +563,7 @@ app.post("/upload-leads", async (req, res) => {
       }
 
       let inferredPublic = null;
-      if (!publicUrl && salesNavUrl && salesNavUrl.includes('/sales/lead/')) {
+      if (!publicUrl && salesNavUrl && salesNavUrl.includes("/sales/lead/")) {
         inferredPublic = derivePublicFromSalesNav(salesNavUrl);
         if (inferredPublic) {
           console.log(`[Heuristic] Derived public URL for #${index + 1}: ${inferredPublic}`);
@@ -613,7 +590,6 @@ app.post("/upload-leads", async (req, res) => {
         timestamp || new Date().toISOString(),
         "scraped"
       );
-
       if (info.changes > 0) inserted++; else skipped++;
     } catch (e) {
       console.error(`Lead #${index + 1} insert error:`, e.message);
@@ -644,6 +620,7 @@ app.post("/upload-leads", async (req, res) => {
   });
 });
 
+// Dashboard data
 app.get("/api/leads", authenticateToken, (req, res) => {
   console.log("Received /api/leads");
   try {
@@ -706,142 +683,7 @@ app.get("/download-leads-excel", authenticateToken, async (req, res) => {
   }
 });
 
-// --- Automation Endpoints ---
-app.get("/api/automation/get-next-leads", authenticateToken, (req, res) => {
-  const limit = parseInt(req.query.limit || "1", 10);
-  const email = req.user.email;
-
-  try {
-    let leads = [];
-    db.transaction(() => {
-      const sel = db.prepare(`
-        SELECT id, COALESCE(public_profile_url, profile_url) AS profile_url,
-               first_name, last_name, organization, title, connection_note
-        FROM leads
-        WHERE user_email = ?
-          AND (automation_status = 'scraped' OR automation_status = 'pending_connect')
-          AND (next_action_due_date IS NULL OR next_action_due_date <= CURRENT_TIMESTAMP)
-        LIMIT ?;
-      `);
-      leads = sel.all(email, limit);
-
-      if (leads.length > 0) {
-        const upd = db.prepare(`
-          UPDATE leads
-          SET automation_status = 'in_progress',
-              last_action_timestamp = CURRENT_TIMESTAMP
-          WHERE id = ?;
-        `);
-        leads.forEach(l => upd.run(l.id));
-      }
-    })();
-
-    return res.json({ success: true, leads });
-  } catch (e) {
-    console.error("get-next-leads error:", e);
-    return res.status(500).json({ success: false, message: "Internal server error getting leads." });
-  }
-});
-
-app.get("/api/automation/runner/tick", authenticateToken, (req, res) => {
-  try {
-    const sel = db.prepare(`
-      SELECT id, COALESCE(public_profile_url, profile_url) AS profile_url,
-             first_name, last_name, organization, title, connection_note
-      FROM leads
-      WHERE user_email = ?
-        AND (automation_status = 'scraped' OR automation_status = 'pending_connect')
-        AND (next_action_due_date IS NULL OR next_action_due_date <= CURRENT_TIMESTAMP)
-      LIMIT 1;
-    `);
-    const lead = sel.get(req.user.email);
-    if (!lead) return res.json({ success: true, leads: [] });
-
-    db.prepare(`
-      UPDATE leads
-      SET automation_status = 'in_progress',
-          last_action_timestamp = CURRENT_TIMESTAMP
-      WHERE id = ?;
-    `).run(lead.id);
-
-    return res.json({ success: true, leads: [lead] });
-  } catch (e) {
-    console.error("runner/tick error:", e);
-    return res.status(500).json({ success: false, message: "Internal server error." });
-  }
-});
-
-app.post("/api/automation/update-status", authenticateToken, (req, res) => {
-  const { lead_id, status, message, action_details = {} } = req.body || {};
-  const email = req.user.email;
-  if (!lead_id || !status) {
-    return res.status(400).json({ success: false, message: "Missing lead_id or status." });
-  }
-
-  let setClauses = [
-    `automation_status = ?`,
-    `last_action_timestamp = CURRENT_TIMESTAMP`,
-  ];
-  const params = [status];
-
-  let nextActionDate = null;
-  switch (status) {
-    case "connection_sent":
-      nextActionDate = new Date(Date.now() + (Math.random() * (5 - 3) + 3) * 24 * 60 * 60 * 1000).toISOString();
-      if (action_details.connection_note_sent) {
-        setClauses.push(`connection_note = ?`);
-        params.push(action_details.connection_note_sent);
-      }
-      break;
-    case "accepted":
-      nextActionDate = new Date(Date.now() + (Math.random() * (2 - 1) + 1) * 60 * 60 * 1000).toISOString();
-      break;
-    case "msg1_sent":
-    case "msg2_sent":
-      nextActionDate = new Date(Date.now() + (Math.random() * (7 - 4) + 4) * 24 * 60 * 60 * 1000).toISOString();
-      break;
-    case "replied":
-    case "skipped":
-    case "error":
-      nextActionDate = null;
-      break;
-    case "profile_viewed":
-      nextActionDate = new Date(Date.now() + (Math.random() * (24 - 12) + 12) * 60 * 60 * 1000).toISOString();
-      break;
-  }
-
-  if (nextActionDate) {
-    setClauses.push(`next_action_due_date = ?`);
-    params.push(nextActionDate);
-  } else {
-    setClauses.push(`next_action_due_date = NULL`);
-  }
-
-  if (action_details.liked_post_url) {
-    setClauses.push(`liked_post_url = ?`);
-    params.push(action_details.liked_post_url);
-  }
-
-  const sql = `
-    UPDATE leads
-    SET ${setClauses.join(", ")}
-    WHERE id = ? AND user_email = ?;
-  `;
-  params.push(lead_id, email);
-
-  try {
-    const info = db.prepare(sql).run(...params);
-    if (info.changes > 0) {
-      return res.json({ success: true, message: "Lead status updated successfully." });
-    }
-    return res.status(404).json({ success: false, message: "Lead not found or not authorized." });
-  } catch (e) {
-    console.error("update-status error:", e);
-    return res.status(500).json({ success: false, message: "Internal server error updating lead status." });
-  }
-});
-
-// --- Connection Status Endpoints (NEW) ---
+// --- NEW: Connection check (protected) ---
 app.get("/api/connection/check", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
@@ -851,37 +693,46 @@ app.get("/api/connection/check", authenticateToken, async (req, res) => {
 
     if (!row?.li_at) {
       logConn(email, "warn", "status_fail", { reason: "no_li_at" });
-      return res.json({
-        connected: false,
-        reason: "No li_at cookie on server. Capture cookies from the extension."
-      });
+      return res.json({ connected: false, reason: "No li_at cookie on server. Capture cookies from the extension." });
     }
+    if (!row?.jsessionid) {
+      logConn(email, "warn", "status_fail", { reason: "no_jsessionid" });
+      return res.json({ connected: false, reason: "No JSESSIONID cookie on server. Re-capture cookies." });
+    }
+
+    const jsess = row.jsessionid; // stored without quotes by extension
+    const cookieHeader = [
+      `li_at=${row.li_at}`,
+      `JSESSIONID="${jsess}"`,
+      row.bcookie ? `bcookie=${row.bcookie}` : null
+    ].filter(Boolean).join("; ");
 
     const url = "https://www.linkedin.com/voyager/api/me";
     try {
       const resp = await fetch(url, {
         headers: {
-          "accept": "application/json",
-          "csrf-token": "ajax:123456789",
-          "cookie": `li_at=${row.li_at};`
+          accept: "application/vnd.linkedin.normalized+json+2.1",
+          "x-restli-protocol-version": "2.0.0",
+          "csrf-token": jsess,     // NO quotes
+          cookie: cookieHeader,    // JSESSIONID WITH quotes
+          "user-agent": "Mozilla/5.0 (compatible; LinqBridge/1.0)"
         },
-        signal: (typeof AbortSignal !== "undefined" && AbortSignal.timeout)
-          ? AbortSignal.timeout(8000)
-          : undefined
+        signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined
       });
 
       if (!resp.ok) {
-        let body = "";
-        try { body = await resp.text(); } catch {}
-        logConn(email, "warn", "status_fail", { http: resp.status, body });
-        return res.json({ connected: false, reason: `HTTP ${resp.status}` });
+        const body = await safeText(resp);
+        logConn(email, "warn", "status_fail", { http: resp.status, body: body?.slice(0, 500) });
+        let reason = `HTTP ${resp.status}`;
+        if (resp.status === 403) reason = "CSRF check failed or cookie pair mismatch. Re-capture cookies.";
+        if (resp.status === 401) reason = "li_at expired. Re-login on LinkedIn and re-capture.";
+        return res.json({ connected: false, reason });
       }
 
-      let data = {};
-      try { data = await resp.json(); } catch {}
+      const data = await (async () => { try { return await resp.json(); } catch { return {}; } })();
       const name =
-        (data?.miniProfile?.firstName && data?.miniProfile?.lastName)
-          ? `${data.miniProfile.firstName} ${data.miniProfile.lastName}`
+        data?.included?.[0]?.firstName && data?.included?.[0]?.lastName
+          ? `${data.included[0].firstName} ${data.included[0].lastName}`
           : (data?.firstName && data?.lastName ? `${data.firstName} ${data.lastName}` : null);
 
       logConn(email, "info", "status_ok", { name });
@@ -896,6 +747,7 @@ app.get("/api/connection/check", authenticateToken, async (req, res) => {
   }
 });
 
+// --- NEW: Connection logs (protected) ---
 app.get("/api/connection/logs", authenticateToken, (req, res) => {
   const email = req.user.email;
   const limit = Math.min(parseInt(req.query.limit || "25", 10), 100);
@@ -907,14 +759,12 @@ app.get("/api/connection/logs", authenticateToken, (req, res) => {
       ORDER BY id DESC
       LIMIT ?;
     `).all(email, limit);
-
     const logs = rows.map(r => ({
       level: r.level,
       event: r.event,
       details: (() => { try { return JSON.parse(r.details); } catch { return r.details; } })(),
       at: r.created_at
     }));
-
     res.json({ success: true, logs });
   } catch (e) {
     console.error("/api/connection/logs error:", e);
@@ -922,15 +772,12 @@ app.get("/api/connection/logs", authenticateToken, (req, res) => {
   }
 });
 
-// --- Root Endpoint ---
+// --- Root (serves your SPA dashboard) ---
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "dashboard.html"));
 });
 
 // --- Start Server ---
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server is running on port ${PORT}`);
-  console.log(
-    `Access your LinqBridge Dashboard at: https://${process.env.REPL_SLUG}.${process.env.REPL_OWNER}.repl.co`
-  );
 });
