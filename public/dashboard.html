@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>LinqBridge Dashboard</title>
+  <link rel="stylesheet" href="dashboard.css"/>
+</head>
+<body>
+  <div class="container">
+    <h1>LinqBridge Dashboard</h1>
+
+    <!-- Auth -->
+    <div id="auth-card" class="card">
+      <div class="tabs">
+        <button id="tab-login" class="tab active">Login</button>
+        <button id="tab-register" class="tab">Register</button>
+      </div>
+
+      <div id="login-form" class="form form-active">
+        <input type="email" id="login-email" placeholder="Email"/>
+        <input type="password" id="login-password" placeholder="Password"/>
+        <button id="login-btn" class="btn primary">Log In</button>
+      </div>
+
+      <div id="register-form" class="form">
+        <input type="email" id="reg-email" placeholder="Email"/>
+        <input type="password" id="reg-password" placeholder="Password"/>
+        <input type="password" id="reg-password2" placeholder="Confirm Password"/>
+        <button id="register-btn" class="btn">Create Account</button>
+      </div>
+
+      <div id="auth-msg" class="msg" style="display:none;"></div>
+    </div>
+
+    <!-- App -->
+    <div id="app" class="card" style="display:none;">
+      <div class="toolbar">
+        <div>
+          <button id="reload-btn" class="btn">Reload Leads</button>
+          <button id="download-btn" class="btn">Download Excel</button>
+        </div>
+        <div class="right">
+          <span id="whoami"></span>
+          <button id="logout-btn" class="btn danger">Logout</button>
+        </div>
+      </div>
+
+      <div id="app-msg" class="msg" style="display:none;"></div>
+
+      <table id="leads-table">
+        <thead>
+        <tr>
+          <th>First</th>
+          <th>Last</th>
+          <th>Organization</th>
+          <th>Title</th>
+          <th>Public URL</th>
+          <th>Sales Nav URL</th>
+          <th>Status</th>
+        </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script src="dashboard.js"></script>
+</body>
+</html>
