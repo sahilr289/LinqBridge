@@ -1,4 +1,4 @@
-// index.js — LinqBridge backend (Auth + Leads + Automation + Connection Check) FINAL
+// index.js — LinqBridge backend (FINAL, with connection logs + robust CORS)
 
 // --- Core Modules ---
 const express = require("express");
@@ -10,33 +10,27 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const fs = require("fs-extra");
 const { v4: uuidv4 } = require("uuid");
-require("dotenv").config(); // load .env if present
+require("dotenv").config();
 
 // --- Server Setup ---
 const app = express();
-const PORT = process.env.PORT || 5000;
-
-// SECURITY: set JWT_SECRET in env for prod
+const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key_change_this_for_prod";
 
-// --- Job Queue (file-backed) ---
+// --- File-backed Job Queue ---
 const DATA_DIR = path.join(__dirname, "data");
 const JOBS_FILE = path.join(DATA_DIR, "jobs.json");
 
 (async () => {
   await fs.ensureDir(DATA_DIR);
   if (!(await fs.pathExists(JOBS_FILE))) {
-    await fs.writeJson(
-      JOBS_FILE,
-      { queued: [], active: [], done: [], failed: [] },
-      { spaces: 2 }
-    );
+    await fs.writeJson(JOBS_FILE, { queued: [], active: [], done: [], failed: [] }, { spaces: 2 });
   }
 })();
 async function readJobs() { return fs.readJson(JOBS_FILE); }
 async function writeJobs(d) { return fs.writeJson(JOBS_FILE, d, { spaces: 2 }); }
 
-// Worker-only auth header
+// --- Worker-only Auth ---
 function requireWorkerAuth(req, res, next) {
   const header = req.get("x-worker-secret");
   if (!header || header !== process.env.WORKER_SHARED_SECRET) {
@@ -49,20 +43,22 @@ function requireWorkerAuth(req, res, next) {
 app.use(express.json({ limit: "50mb" }));
 app.use(express.static("public"));
 
-// CORS: allow specific origins (extension + Railway domain); allow no-origin (same-origin, curl)
-const ALLOWED_ORIGINS = [
+// CORS: allow extension + Railway + localhost
+const ALLOWED_ORIGINS = new Set([
   "chrome-extension://mhfjpfanjgflnflifenhoejbfjecleen",
   "http://localhost:3000",
-  "https://calm-rejoicing-linqbridge.up.railway.app"
-];
+  "http://localhost:8080",
+  "https://calm-rejoicing-linqbridge.up.railway.app",
+]);
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    // allow no-origin (e.g., curl/postman) and allowed list
+    if (!origin || ALLOWED_ORIGINS.has(origin)) return cb(null, true);
     return cb(new Error(`Origin ${origin} not allowed by CORS`));
   },
-  methods: ["GET", "POST", "OPTIONS", "PUT", "DELETE"],
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "x-worker-secret"],
-  credentials: false
+  credentials: false,
 }));
 app.options("*", cors());
 
@@ -131,18 +127,18 @@ function initializeDatabase() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_email TEXT NOT NULL,
       level TEXT NOT NULL,      -- info | warn | error
-      event TEXT NOT NULL,      -- e.g. cookies_saved | status_ok | status_fail
-      details TEXT,
+      event TEXT NOT NULL,      -- cookies_saved | status_ok | status_fail
+      details TEXT,             -- JSON/string
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
   `);
 
-  // Partial UNIQUE indexes (SQLite supports WHERE on indexes)
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_unique_public
     ON leads(user_email, public_profile_url)
     WHERE public_profile_url IS NOT NULL;
   `);
+
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_unique_legacy
     ON leads(user_email, profile_url)
@@ -156,17 +152,15 @@ initializeDatabase();
 // --- Helpers ---
 function logConn(email, level, event, detailsObj) {
   try {
-    const stmt = db.prepare(`
+    db.prepare(`
       INSERT INTO connection_logs (user_email, level, event, details)
       VALUES (?, ?, ?, ?)
-    `);
-    stmt.run(email, level, event, detailsObj ? JSON.stringify(detailsObj) : null);
+    `).run(email, level, event, detailsObj ? JSON.stringify(detailsObj) : null);
   } catch (e) {
     console.warn("logConn error:", e.message);
   }
 }
 
-// Get latest 'li_at' cookie for a user.
 function getLatestLiAtForUser(email) {
   try {
     const row = db
@@ -179,7 +173,6 @@ function getLatestLiAtForUser(email) {
   }
 }
 
-// Extract Sales Navigator profile ID.
 function extractFsSalesProfileId(salesNavUrl = "") {
   const m =
     salesNavUrl.match(/fs_salesProfile:(\d+)/) ||
@@ -187,7 +180,6 @@ function extractFsSalesProfileId(salesNavUrl = "") {
   return m ? m[1] : null;
 }
 
-// LinkedIn Sales API resolver (best-effort; may change any time).
 async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
   if (!salesNavUrl || !liAtCookie) return null;
   const profileId = extractFsSalesProfileId(salesNavUrl);
@@ -198,25 +190,25 @@ async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
     const resp = await fetch(apiUrl, {
       method: "GET",
       headers: {
-        accept: "application/json",
+        "accept": "application/json",
         "x-restli-protocol-version": "2.0.0",
         "csrf-token": "ajax:123456789",
-        cookie: `li_at=${liAtCookie};`
+        "cookie": `li_at=${liAtCookie};`,
       },
-      signal: AbortSignal.timeout ? AbortSignal.timeout(12_000) : undefined
+      signal: AbortSignal.timeout ? AbortSignal.timeout(12000) : undefined,
     });
     if (!resp.ok) {
       console.warn("resolveSalesNavToPublicUrl non-OK:", resp.status, await safeText(resp));
       return null;
     }
-    const data = await resp.json().catch(() => ({}));
+    const data = await (async () => { try { return await resp.json(); } catch { return {}; } })();
     const candidates = [
       data?.profile?.profileUrl,
       data?.profile?.profileUrn,
       data?.publicProfileUrl,
       data?.profile?.publicIdentifier
         ? `https://www.linkedin.com/in/${data.profile.publicIdentifier}`
-        : null
+        : null,
     ].filter(Boolean);
     return candidates[0] || null;
   } catch (e) {
@@ -225,9 +217,10 @@ async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
   }
 }
 
-async function safeText(res) { try { return await res.text(); } catch { return ""; } }
+async function safeText(res) {
+  try { return await res.text(); } catch { return ""; }
+}
 
-// Heuristic fallback for Sales Nav → public URL
 function derivePublicFromSalesNav(salesNavUrl) {
   if (!salesNavUrl) return null;
   const m = salesNavUrl.match(/\/sales\/lead\/([^,\/\?]+)/i);
@@ -256,11 +249,8 @@ app.post("/register", async (req, res) => {
   try {
     const hashed = await bcrypt.hash(password, 10);
     const info = db.prepare("INSERT INTO users (email, password) VALUES (?, ?)").run(email, hashed);
-    if (info.changes > 0) {
-      console.log(`User registered: ${email}`);
-      return res.status(201).json({ success: true, message: "User registered successfully." });
-    }
-    return res.status(409).json({ success: false, message: "User already exists." });
+    if (info.changes > 0) return res.status(201).json({ success: true, message: "User registered successfully." });
+    return res.status(409).json({ success: false, message: "User with this email already exists." });
   } catch (e) {
     console.error("Register error:", e);
     return res.status(500).json({ success: false, message: "Internal server error during registration." });
@@ -278,7 +268,6 @@ app.post("/login", async (req, res) => {
     const ok = await bcrypt.compare(password, user.password);
     if (!ok) return res.status(401).json({ success: false, message: "Invalid credentials." });
     const token = jwt.sign({ email: user.email }, JWT_SECRET, { expiresIn: "24h" });
-    console.log(`User logged in: ${email}`);
     return res.status(200).json({ success: true, message: "Logged in successfully.", token, userEmail: user.email });
   } catch (e) {
     console.error("Login error:", e);
@@ -307,7 +296,6 @@ app.post("/jobs", async (req, res) => {
     d.queued.push(job);
     d.queued.sort((a, b) => a.priority - b.priority);
     await writeJobs(d);
-
     res.json({ ok: true, job });
   } catch (e) {
     console.error(e);
@@ -326,6 +314,7 @@ app.post("/jobs/next", requireWorkerAuth, async (req, res) => {
     } else {
       idx = d.queued.length ? 0 : -1;
     }
+
     if (idx === -1) return res.json({ ok: true, job: null });
 
     const job = d.queued.splice(idx, 1)[0];
@@ -334,7 +323,6 @@ app.post("/jobs/next", requireWorkerAuth, async (req, res) => {
     job.startedAt = new Date().toISOString();
     d.active.push(job);
     await writeJobs(d);
-
     res.json({ ok: true, job });
   } catch (e) {
     console.error(e);
@@ -357,7 +345,6 @@ app.post("/jobs/:id/complete", requireWorkerAuth, async (req, res) => {
     job.result = result ?? null;
     d.done.push(job);
     await writeJobs(d);
-
     res.json({ ok: true, job });
   } catch (e) {
     console.error(e);
@@ -386,12 +373,12 @@ app.post("/jobs/:id/fail", requireWorkerAuth, async (req, res) => {
         setTimeout(async () => {
           const d2 = await readJobs();
           d2.queued.push(job);
-          d2.queued.sort((a,b) => a.priority - b.priority);
+          d2.queued.sort((a, b) => a.priority - b.priority);
           await writeJobs(d2);
         }, delayMs);
       } else {
         d.queued.push(job);
-        d.queued.sort((a,b) => a.priority - b.priority);
+        d.queued.sort((a, b) => a.priority - b.priority);
       }
     } else {
       d.failed.push(job);
@@ -408,38 +395,32 @@ app.post("/jobs/:id/fail", requireWorkerAuth, async (req, res) => {
 app.get("/jobs/stats", async (_req, res) => {
   const d = await readJobs();
   res.json({
-    counts: {
-      queued: d.queued.length,
-      active: d.active.length,
-      done: d.done.length,
-      failed: d.failed.length,
-    },
+    counts: { queued: d.queued.length, active: d.active.length, done: d.done.length, failed: d.failed.length },
   });
 });
 
-// --- Cookie Endpoints from extension ---
+// --- Cookies from extension ---
 app.post("/store-cookies", (req, res) => {
   try {
-    const { email, cookies, timestamp } = req.body || {};
-    if (!email || !cookies || !cookies.li_at) {
+    const body = req.body || {};
+    // accept either userEmail or email
+    const email = body.userEmail || body.email;
+    const cookies = body.cookies || {};
+    const timestamp = body.timestamp || new Date().toISOString();
+
+    if (!email || !cookies.li_at) {
       return res.status(400).json({ success: false, message: "Missing email or li_at cookie." });
     }
-    const stmt = db.prepare(
-      "INSERT INTO cookies (email, li_at, jsessionid, bcookie, timestamp) VALUES (?, ?, ?, ?, ?)"
-    );
-    stmt.run(
-      email,
-      cookies.li_at,
-      cookies.JSESSIONID || null,
-      cookies.bcookie || null,
-      timestamp || new Date().toISOString()
-    );
 
-    // log success
+    db.prepare(`
+      INSERT INTO cookies (email, li_at, jsessionid, bcookie, timestamp)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(email, cookies.li_at, cookies.JSESSIONID || null, cookies.bcookie || null, timestamp);
+
     logConn(email, "info", "cookies_saved", {
       has_li_at: !!cookies.li_at,
       has_jsessionid: !!cookies.JSESSIONID,
-      has_bcookie: !!cookies.bcookie
+      has_bcookie: !!cookies.bcookie,
     });
 
     return res.json({ success: true, message: "Cookies stored successfully." });
@@ -449,15 +430,13 @@ app.post("/store-cookies", (req, res) => {
   }
 });
 
-// Latest li_at for worker/use
+// Latest li_at for the logged-in user
 app.get("/api/me/liat", authenticateToken, (req, res) => {
   try {
     const row = db
       .prepare("SELECT li_at FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1")
       .get(req.user.email);
-    if (!row || !row.li_at) {
-      return res.status(404).json({ success: false, message: "No li_at found for user." });
-    }
+    if (!row?.li_at) return res.status(404).json({ success: false, message: "No li_at found for user." });
     return res.json({ success: true, li_at: row.li_at });
   } catch (e) {
     console.error("liat error:", e);
@@ -465,7 +444,7 @@ app.get("/api/me/liat", authenticateToken, (req, res) => {
   }
 });
 
-// Enqueue SEND_CONNECTION (protected)
+// Enqueue SEND_CONNECTION job
 app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
@@ -484,22 +463,17 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
       payload: {
         profileUrl,
         note,
-        cookieBundle: {
-          li_at: row.li_at,
-          jsessionid: row.jsessionid || null,
-          bcookie: row.bcookie || null
-        }
+        cookieBundle: { li_at: row.li_at, jsessionid: row.jsessionid || null, bcookie: row.bcookie || null },
       },
       priority,
       status: "queued",
       enqueuedAt: new Date().toISOString(),
       attempts: 0,
-      lastError: null
+      lastError: null,
     };
     d.queued.push(job);
-    d.queued.sort((a,b) => a.priority - b.priority);
+    d.queued.sort((a, b) => a.priority - b.priority);
     await writeJobs(d);
-
     res.json({ ok: true, job });
   } catch (e) {
     console.error("enqueue-send-connection error:", e);
@@ -507,10 +481,12 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
   }
 });
 
-// --- Lead Management ---
+// --- Leads upload (accept userEmail OR email) ---
 app.post("/upload-leads", async (req, res) => {
   console.log("Received /upload-leads");
-  const { leads, userEmail, timestamp } = req.body || {};
+  const { leads, timestamp } = req.body || {};
+  const userEmail = req.body.userEmail || req.body.email; // ← robust
+
   if (!userEmail || !Array.isArray(leads) || leads.length === 0) {
     return res.status(400).json({ success: false, message: "Missing userEmail or leads." });
   }
@@ -520,13 +496,13 @@ app.post("/upload-leads", async (req, res) => {
     console.warn("[upload-leads] No li_at stored for", userEmail, "- will save Sales Nav URLs as-is.");
   }
 
-  const sql = `
+  const insertLeadSql = `
     INSERT OR IGNORE INTO leads
       (user_email, first_name, last_name, profile_url, public_profile_url, sales_nav_url,
        organization, title, timestamp, automation_status)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
   `;
-  const insertStmt = db.prepare(sql);
+  const insertStmt = db.prepare(insertLeadSql);
 
   let inserted = 0, skipped = 0;
 
@@ -536,7 +512,6 @@ app.post("/upload-leads", async (req, res) => {
 
   async function processOne(rawLead, index) {
     try {
-      const fullName = rawLead.full_name || "";
       const firstName = rawLead.first_name || null;
       const lastName  = rawLead.last_name || null;
       const organization = rawLead.company || null;
@@ -549,31 +524,23 @@ app.post("/upload-leads", async (req, res) => {
       let salesNavUrl =
         (rawLead.sales_nav_url && rawLead.sales_nav_url !== "N/A")
           ? rawLead.sales_nav_url
-          : (rawLead.profile_url || null);
+          : (rawLead.profile_url || null); // sometimes profile_url holds SN URL
 
       const profileUrlLegacy = rawLead.profile_url || null;
 
+      // Try resolve via Sales API if we have li_at
       if (!publicUrl && salesNavUrl && liAt) {
         publicUrl = await resolveSalesNavToPublicUrl(salesNavUrl, liAt);
-        if (publicUrl) {
-          console.log(`[Resolver] Resolved public URL for #${index + 1}: ${publicUrl}`);
-        } else {
-          console.warn(`[Resolver] Could not resolve public URL for #${index + 1} (${fullName}).`);
-        }
       }
-
+      // Heuristic fallback
       let inferredPublic = null;
       if (!publicUrl && salesNavUrl && salesNavUrl.includes("/sales/lead/")) {
         inferredPublic = derivePublicFromSalesNav(salesNavUrl);
-        if (inferredPublic) {
-          console.log(`[Heuristic] Derived public URL for #${index + 1}: ${inferredPublic}`);
-        }
       }
 
       const public_profile_url_to_store = publicUrl || inferredPublic || null;
 
       if (!public_profile_url_to_store && !profileUrlLegacy && !salesNavUrl) {
-        console.warn(`[Data Warning] Skipping lead ${index + 1} (no URL fields at all): ${fullName}`);
         skipped++;
         return;
       }
@@ -590,23 +557,21 @@ app.post("/upload-leads", async (req, res) => {
         timestamp || new Date().toISOString(),
         "scraped"
       );
+
       if (info.changes > 0) inserted++; else skipped++;
-    } catch (e) {
-      console.error(`Lead #${index + 1} insert error:`, e.message);
+    } catch {
       skipped++;
     }
   }
 
   for (let w = 0; w < Math.min(CONCURRENCY, queue.length); w++) {
-    workers.push(
-      (async function runWorker() {
-        while (queue.length) {
-          const idx = leads.length - queue.length;
-          const next = queue.shift();
-          await processOne(next, idx);
-        }
-      })()
-    );
+    workers.push((async function runWorker() {
+      while (queue.length) {
+        const next = queue.shift();
+        const idx = leads.length - queue.length;
+        await processOne(next, idx - 1);
+      }
+    })());
   }
   await Promise.all(workers);
 
@@ -620,9 +585,8 @@ app.post("/upload-leads", async (req, res) => {
   });
 });
 
-// Dashboard data
+// --- Leads / Excel / Automation ---
 app.get("/api/leads", authenticateToken, (req, res) => {
-  console.log("Received /api/leads");
   try {
     const rows = db
       .prepare("SELECT * FROM leads WHERE user_email = ? ORDER BY scraped_at DESC")
@@ -635,15 +599,12 @@ app.get("/api/leads", authenticateToken, (req, res) => {
 });
 
 app.get("/download-leads-excel", authenticateToken, async (req, res) => {
-  console.log("Received /download-leads-excel");
   try {
     const rows = db
       .prepare("SELECT * FROM leads WHERE user_email = ? ORDER BY scraped_at DESC")
       .all(req.user.email);
 
-    if (rows.length === 0) {
-      return res.status(404).send(`No leads found for ${req.user.email}.`);
-    }
+    if (rows.length === 0) return res.status(404).send(`No leads found for ${req.user.email}.`);
 
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet("Leads Data");
@@ -683,7 +644,136 @@ app.get("/download-leads-excel", authenticateToken, async (req, res) => {
   }
 });
 
-// --- NEW: Connection check (protected) ---
+app.get("/api/automation/get-next-leads", authenticateToken, (req, res) => {
+  const limit = parseInt(req.query.limit || "1", 10);
+  const email = req.user.email;
+  try {
+    let leads = [];
+    db.transaction(() => {
+      const sel = db.prepare(`
+        SELECT id, COALESCE(public_profile_url, profile_url) AS profile_url,
+               first_name, last_name, organization, title, connection_note
+        FROM leads
+        WHERE user_email = ?
+          AND (automation_status = 'scraped' OR automation_status = 'pending_connect')
+          AND (next_action_due_date IS NULL OR next_action_due_date <= CURRENT_TIMESTAMP)
+        LIMIT ?;
+      `);
+      leads = sel.all(email, limit);
+      if (leads.length > 0) {
+        const upd = db.prepare(`
+          UPDATE leads
+          SET automation_status = 'in_progress',
+              last_action_timestamp = CURRENT_TIMESTAMP
+          WHERE id = ?;
+        `);
+        leads.forEach(l => upd.run(l.id));
+      }
+    })();
+    return res.json({ success: true, leads });
+  } catch (e) {
+    console.error("get-next-leads error:", e);
+    return res.status(500).json({ success: false, message: "Internal server error getting leads." });
+  }
+});
+
+app.get("/api/automation/runner/tick", authenticateToken, (req, res) => {
+  try {
+    const sel = db.prepare(`
+      SELECT id, COALESCE(public_profile_url, profile_url) AS profile_url,
+             first_name, last_name, organization, title, connection_note
+      FROM leads
+      WHERE user_email = ?
+        AND (automation_status = 'scraped' OR automation_status = 'pending_connect')
+        AND (next_action_due_date IS NULL OR next_action_due_date <= CURRENT_TIMESTAMP)
+      LIMIT 1;
+    `);
+    const lead = sel.get(req.user.email);
+    if (!lead) return res.json({ success: true, leads: [] });
+
+    db.prepare(`
+      UPDATE leads
+      SET automation_status = 'in_progress',
+          last_action_timestamp = CURRENT_TIMESTAMP
+      WHERE id = ?;
+    `).run(lead.id);
+
+    return res.json({ success: true, leads: [lead] });
+  } catch (e) {
+    console.error("runner/tick error:", e);
+    return res.status(500).json({ success: false, message: "Internal server error." });
+  }
+});
+
+app.post("/api/automation/update-status", authenticateToken, (req, res) => {
+  const { lead_id, status, action_details = {} } = req.body || {};
+  const email = req.user.email;
+  if (!lead_id || !status) {
+    return res.status(400).json({ success: false, message: "Missing lead_id or status." });
+  }
+
+  let setClauses = [
+    `automation_status = ?`,
+    `last_action_timestamp = CURRENT_TIMESTAMP`,
+  ];
+  const params = [status];
+
+  let nextActionDate = null;
+  switch (status) {
+    case "connection_sent":
+      nextActionDate = new Date(Date.now() + (Math.random() * (5 - 3) + 3) * 86400000).toISOString();
+      if (action_details.connection_note_sent) {
+        setClauses.push(`connection_note = ?`);
+        params.push(action_details.connection_note_sent);
+      }
+      break;
+    case "accepted":
+      nextActionDate = new Date(Date.now() + (Math.random() * (2 - 1) + 1) * 3600000).toISOString();
+      break;
+    case "msg1_sent":
+    case "msg2_sent":
+      nextActionDate = new Date(Date.now() + (Math.random() * (7 - 4) + 4) * 86400000).toISOString();
+      break;
+    case "replied":
+    case "skipped":
+    case "error":
+      nextActionDate = null;
+      break;
+    case "profile_viewed":
+      nextActionDate = new Date(Date.now() + (Math.random() * (24 - 12) + 12) * 3600000).toISOString();
+      break;
+  }
+
+  if (nextActionDate) {
+    setClauses.push(`next_action_due_date = ?`);
+    params.push(nextActionDate);
+  } else {
+    setClauses.push(`next_action_due_date = NULL`);
+  }
+
+  if (action_details.liked_post_url) {
+    setClauses.push(`liked_post_url = ?`);
+    params.push(action_details.liked_post_url);
+  }
+
+  const sql = `
+    UPDATE leads
+    SET ${setClauses.join(", ")}
+    WHERE id = ? AND user_email = ?;
+  `;
+  params.push(lead_id, email);
+
+  try {
+    const info = db.prepare(sql).run(...params);
+    if (info.changes > 0) return res.json({ success: true, message: "Lead status updated successfully." });
+    return res.status(404).json({ success: false, message: "Lead not found or not authorized." });
+  } catch (e) {
+    console.error("update-status error:", e);
+    return res.status(500).json({ success: false, message: "Internal server error updating lead status." });
+  }
+});
+
+// --- Connection status & logs ---
 app.get("/api/connection/check", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
@@ -695,47 +785,32 @@ app.get("/api/connection/check", authenticateToken, async (req, res) => {
       logConn(email, "warn", "status_fail", { reason: "no_li_at" });
       return res.json({ connected: false, reason: "No li_at cookie on server. Capture cookies from the extension." });
     }
-    if (!row?.jsessionid) {
-      logConn(email, "warn", "status_fail", { reason: "no_jsessionid" });
-      return res.json({ connected: false, reason: "No JSESSIONID cookie on server. Re-capture cookies." });
-    }
 
-    const jsess = row.jsessionid; // stored without quotes by extension
-    const cookieHeader = [
-      `li_at=${row.li_at}`,
-      `JSESSIONID="${jsess}"`,
-      row.bcookie ? `bcookie=${row.bcookie}` : null
-    ].filter(Boolean).join("; ");
-
+    // Basic identity ping (expect 200 if li_at is valid)
     const url = "https://www.linkedin.com/voyager/api/me";
     try {
       const resp = await fetch(url, {
         headers: {
-          accept: "application/vnd.linkedin.normalized+json+2.1",
-          "x-restli-protocol-version": "2.0.0",
-          "csrf-token": jsess,     // NO quotes
-          cookie: cookieHeader,    // JSESSIONID WITH quotes
-          "user-agent": "Mozilla/5.0 (compatible; LinqBridge/1.0)"
+          "accept": "application/json",
+          "csrf-token": "ajax:123456789",
+          "cookie": `li_at=${row.li_at}; ${row.jsessionid ? `JSESSIONID="${row.jsessionid}";` : ""} ${row.bcookie ? `bcookie=${row.bcookie};` : ""}`,
         },
-        signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined
+        signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
       });
 
       if (!resp.ok) {
         const body = await safeText(resp);
-        logConn(email, "warn", "status_fail", { http: resp.status, body: body?.slice(0, 500) });
-        let reason = `HTTP ${resp.status}`;
-        if (resp.status === 403) reason = "CSRF check failed or cookie pair mismatch. Re-capture cookies.";
-        if (resp.status === 401) reason = "li_at expired. Re-login on LinkedIn and re-capture.";
-        return res.json({ connected: false, reason });
+        logConn(email, "warn", "status_fail", { http: resp.status, body: body?.slice(0, 200) });
+        return res.json({ connected: false, reason: `HTTP ${resp.status}` });
       }
 
       const data = await (async () => { try { return await resp.json(); } catch { return {}; } })();
       const name =
-        data?.included?.[0]?.firstName && data?.included?.[0]?.lastName
-          ? `${data.included[0].firstName} ${data.included[0].lastName}`
+        data?.miniProfile?.firstName && data?.miniProfile?.lastName
+          ? `${data.miniProfile.firstName} ${data.miniProfile.lastName}`
           : (data?.firstName && data?.lastName ? `${data.firstName} ${data.lastName}` : null);
 
-      logConn(email, "info", "status_ok", { name });
+      logConn(email, "info", "status_ok", { name: name || null });
       return res.json({ connected: true, name: name || null });
     } catch (e) {
       logConn(email, "error", "status_fail", { error: e.message });
@@ -747,7 +822,6 @@ app.get("/api/connection/check", authenticateToken, async (req, res) => {
   }
 });
 
-// --- NEW: Connection logs (protected) ---
 app.get("/api/connection/logs", authenticateToken, (req, res) => {
   const email = req.user.email;
   const limit = Math.min(parseInt(req.query.limit || "25", 10), 100);
@@ -759,11 +833,12 @@ app.get("/api/connection/logs", authenticateToken, (req, res) => {
       ORDER BY id DESC
       LIMIT ?;
     `).all(email, limit);
+
     const logs = rows.map(r => ({
       level: r.level,
       event: r.event,
       details: (() => { try { return JSON.parse(r.details); } catch { return r.details; } })(),
-      at: r.created_at
+      at: r.created_at,
     }));
     res.json({ success: true, logs });
   } catch (e) {
@@ -772,9 +847,13 @@ app.get("/api/connection/logs", authenticateToken, (req, res) => {
   }
 });
 
-// --- Root (serves your SPA dashboard) ---
+// --- Root (Dashboard) ---
 app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "dashboard.html"));
+  const file = path.join(__dirname, "public", "dashboard.html");
+  fs.pathExists(file).then(exists => {
+    if (exists) return res.sendFile(file);
+    res.type("text/plain").send("LinqBridge API OK");
+  });
 });
 
 // --- Start Server ---
