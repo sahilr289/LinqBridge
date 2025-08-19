@@ -55,8 +55,7 @@ app.use(express.static("public"));
 const ALLOWED_ORIGINS = [
   "chrome-extension://mhfjpfanjgflnflifenhoejbfjecleen",
   "http://localhost:3000",
-  // In production, replace with your actual dashboard domain.
-  // "https://your-dashboard-domain.com"
+  "https://calm-rejoicing-linqbridge.up.railway.app"
 ];
 app.use(cors({
   origin: (origin, cb) => {
