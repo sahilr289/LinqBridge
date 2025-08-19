@@ -1,4 +1,4 @@
-// index.js — LinqBridge backend (Auth + Leads + Automation) FINAL
+// index.js — LinqBridge backend (Auth + Leads + Automation) — FINAL
 
 const express = require("express");
 const cors = require("cors");
@@ -7,8 +7,6 @@ const path = require("path");
 const ExcelJS = require("exceljs");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-
-// --- Job Queue (file-backed) ---
 const fs = require("fs-extra");
 const { v4: uuidv4 } = require("uuid");
 
@@ -16,21 +14,19 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key";
 
+// -------------------- File-backed Job Queue --------------------
 const DATA_DIR  = path.join(__dirname, "data");
 const JOBS_FILE = path.join(DATA_DIR, "jobs.json");
-
-// init queue storage once at boot
 (async () => {
   await fs.ensureDir(DATA_DIR);
   if (!(await fs.pathExists(JOBS_FILE))) {
     await fs.writeJson(JOBS_FILE, { queued: [], active: [], done: [], failed: [] }, { spaces: 2 });
   }
 })();
-
 async function readJobs(){ return fs.readJson(JOBS_FILE); }
 async function writeJobs(d){ return fs.writeJson(JOBS_FILE, d, { spaces: 2 }); }
 
-// worker-only auth header
+// Worker shared-secret gate
 function requireWorkerAuth(req, res, next) {
   const header = req.get("x-worker-secret");
   if (!header || header !== process.env.WORKER_SHARED_SECRET) {
@@ -39,23 +35,32 @@ function requireWorkerAuth(req, res, next) {
   next();
 }
 
-// ---------- Middleware ----------
+// -------------------- Middleware --------------------
 app.use(express.json({ limit: "50mb" }));
 app.use(express.static("public"));
-app.use(
-  cors({
-    origin: "*", // tighten in prod
-    methods: ["GET", "POST", "PUT", "DELETE"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
 
-// ---------- DB ----------
+// CORS: allow your Chrome extension + optional app origins; handle preflight
+const ALLOWED_ORIGINS = [
+  "chrome-extension://mhfjpfanjgflnflifenhoejbfjecleen", // your extension ID
+  "http://localhost:3000",                                // optional: dev dashboard
+  "https://your-dashboard-domain.com"                     // optional: prod dashboard
+];
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error(`Origin ${origin} not allowed by CORS`));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: false
+}));
+app.options("*", cors());
+
+// -------------------- Database --------------------
 const dbPath = path.join(__dirname, "linqbridge.db");
-const db = new Database(dbPath, { verbose: console.log });
+const db = new Database(dbPath);
 
 function initializeDatabase() {
-  // Tables (no expressions in UNIQUE constraints)
   db.exec(`
     CREATE TABLE IF NOT EXISTS leads (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,31 +115,26 @@ function initializeDatabase() {
     );
   `);
 
-  // Partial UNIQUE indexes (valid in SQLite; enforce per-user uniqueness)
+  // Partial unique indexes (SQLite supports WHERE on indexes)
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_unique_public
     ON leads(user_email, public_profile_url)
     WHERE public_profile_url IS NOT NULL;
   `);
-
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_unique_legacy
     ON leads(user_email, profile_url)
     WHERE profile_url IS NOT NULL;
   `);
 
-  console.log(
-    "Database initialized: Leads, Message Templates, Users, Cookies, and unique indexes ready."
-  );
+  console.log("Database initialized: Leads, Message Templates, Users, Cookies, and unique indexes ready.");
 }
 initializeDatabase();
 
-// --- Helper: get the latest li_at for a user (from /store-cookies) ---
+// -------------------- Helpers --------------------
 function getLatestLiAtForUser(email) {
   try {
-    const row = db
-      .prepare("SELECT li_at FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1")
-      .get(email);
+    const row = db.prepare("SELECT li_at FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1").get(email);
     return row?.li_at || null;
   } catch (e) {
     console.error("getLatestLiAtForUser error:", e);
@@ -142,16 +142,13 @@ function getLatestLiAtForUser(email) {
   }
 }
 
-// --- Helper: pull fs_salesProfile ID from a Sales Navigator URL ---
 function extractFsSalesProfileId(salesNavUrl = "") {
-  // matches ...fs_salesProfile:12345678 OR urn:li:fs_salesProfile:(12345678)
   const m =
-    salesNavUrl.match(/fs_salesProfile:(\d+)/) ||
-    salesNavUrl.match(/fs_salesProfile:\((\d+)\)/);
+    salesNavUrl.match(/fs_salesProfile:(\\d+)/) ||
+    salesNavUrl.match(/fs_salesProfile:\\((\\d+)\\)/);
   return m ? m[1] : null;
 }
 
-// --- Helper: resolve Sales Nav → public /in/ URL using LinkedIn sales-api (requires li_at) ---
 async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
   if (!salesNavUrl || !liAtCookie) return null;
   const profileId = extractFsSalesProfileId(salesNavUrl);
@@ -160,18 +157,20 @@ async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
   const apiUrl = `https://www.linkedin.com/sales-api/salesApiProfiles/${profileId}`;
 
   try {
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timeout = setTimeout(() => controller?.abort(), 12000);
+
     const res = await fetch(apiUrl, {
       method: "GET",
-      // Minimal headers. We send li_at as cookie. csrf-token is often required but value is not strictly validated.
       headers: {
         "accept": "application/json",
         "x-restli-protocol-version": "2.0.0",
         "csrf-token": "ajax:123456789",
         "cookie": `li_at=${liAtCookie};`
       },
-      // reasonable timeout via AbortController pattern
-      signal: AbortSignal.timeout ? AbortSignal.timeout(12_000) : undefined
+      signal: controller?.signal
     });
+    clearTimeout(timeout);
 
     if (!res.ok) {
       console.warn("resolveSalesNavToPublicUrl non-OK:", res.status, await safeText(res));
@@ -179,14 +178,11 @@ async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
     }
 
     const data = await res.json().catch(() => ({}));
-    // Common spots where public URL appears (this can vary)
     const candidates = [
       data?.profile?.profileUrl,
-      data?.profile?.profileUrn,        // sometimes points to /in/
+      data?.profile?.profileUrn,
       data?.publicProfileUrl,
-      data?.profile?.publicIdentifier   // sometimes just the slug
-        ? `https://www.linkedin.com/in/${data.profile.publicIdentifier}`
-        : null
+      data?.profile?.publicIdentifier ? `https://www.linkedin.com/in/${data.profile.publicIdentifier}` : null
     ].filter(Boolean);
 
     return candidates[0] || null;
@@ -196,24 +192,16 @@ async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
   }
 }
 
-// Tiny helper so we can log text body safely on non-OK responses
-async function safeText(res) {
-  try { return await res.text(); } catch { return ""; }
-}
+async function safeText(res) { try { return await res.text(); } catch { return ""; } }
 
-// --- Helper: derive a public URL from Sales Navigator URL (heuristic fallback) ---
 function derivePublicFromSalesNav(salesNavUrl) {
   if (!salesNavUrl) return null;
-  // Try to extract the first token after /sales/lead/
-  // e.g. /sales/lead/ACwAA... -> /in/ACwAA...
-  const m = salesNavUrl.match(/\/sales\/lead\/([^,\/\?]+)/i);
-  if (m && m[1]) {
-    return `https://www.linkedin.com/in/${m[1]}`;
-  }
+  const m = salesNavUrl.match(/\\/sales\\/lead\\/([^,\\/\\?]+)/i);
+  if (m && m[1]) return `https://www.linkedin.com/in/${m[1]}`;
   return null;
 }
 
-// ---------- Auth ----------
+// -------------------- Auth --------------------
 function authenticateToken(req, res, next) {
   const auth = req.headers["authorization"];
   const token = auth && auth.split(" ")[1];
@@ -228,9 +216,7 @@ function authenticateToken(req, res, next) {
 app.post("/register", async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {
-    return res
-      .status(400)
-      .json({ success: false, message: "Email and password are required." });
+    return res.status(400).json({ success: false, message: "Email and password are required." });
   }
   try {
     const hashed = await bcrypt.hash(password, 10);
@@ -238,27 +224,19 @@ app.post("/register", async (req, res) => {
     const info = stmt.run(email, hashed);
     if (info.changes > 0) {
       console.log(`User registered: ${email}`);
-      return res
-        .status(201)
-        .json({ success: true, message: "User registered successfully." });
+      return res.status(201).json({ success: true, message: "User registered successfully." });
     }
-    return res
-      .status(409)
-      .json({ success: false, message: "User with this email already exists." });
+    return res.status(409).json({ success: false, message: "User with this email already exists." });
   } catch (e) {
     console.error("Register error:", e);
-    return res
-      .status(500)
-      .json({ success: false, message: "Internal server error during registration." });
+    return res.status(500).json({ success: false, message: "Internal server error during registration." });
   }
 });
 
 app.post("/login", async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {
-    return res
-      .status(400)
-      .json({ success: false, message: "Email and password are required." });
+    return res.status(400).json({ success: false, message: "Email and password are required." });
   }
   try {
     const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
@@ -270,14 +248,11 @@ app.post("/login", async (req, res) => {
     return res.status(200).json({ success: true, message: "Logged in successfully.", token, userEmail: user.email });
   } catch (e) {
     console.error("Login error:", e);
-    return res
-      .status(500)
-      .json({ success: false, message: "Internal server error during login." });
+    return res.status(500).json({ success: false, message: "Internal server error during login." });
   }
 });
 
-// ---------- Job Queue Endpoints ----------
-// Public: enqueue a job
+// -------------------- Job Queue API --------------------
 app.post("/jobs", async (req, res) => {
   try {
     const { type, payload, priority = 5 } = req.body || {};
@@ -285,13 +260,10 @@ app.post("/jobs", async (req, res) => {
 
     const job = {
       id: uuidv4(),
-      type,                      // e.g., "SEND_CONNECTION"
-      payload: payload || {},
-      priority,                  // 1(high)–9(low)
-      status: "queued",
+      type, payload: payload || {},
+      priority, status: "queued",
       enqueuedAt: new Date().toISOString(),
-      attempts: 0,
-      lastError: null,
+      attempts: 0, lastError: null
     };
 
     const d = await readJobs();
@@ -306,7 +278,6 @@ app.post("/jobs", async (req, res) => {
   }
 });
 
-// Worker: pull next job
 app.post("/jobs/next", requireWorkerAuth, async (req, res) => {
   try {
     const { types } = req.body || {};
@@ -335,7 +306,6 @@ app.post("/jobs/next", requireWorkerAuth, async (req, res) => {
   }
 });
 
-// Worker: complete job
 app.post("/jobs/:id/complete", requireWorkerAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -359,7 +329,6 @@ app.post("/jobs/:id/complete", requireWorkerAuth, async (req, res) => {
   }
 });
 
-// Worker: fail job (optional requeue)
 app.post("/jobs/:id/fail", requireWorkerAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -400,7 +369,6 @@ app.post("/jobs/:id/fail", requireWorkerAuth, async (req, res) => {
   }
 });
 
-// Dev: queue stats
 app.get("/jobs/stats", async (_req, res) => {
   const d = await readJobs();
   res.json({
@@ -413,7 +381,7 @@ app.get("/jobs/stats", async (_req, res) => {
   });
 });
 
-// ---------- Cookies from extension ----------
+// -------------------- Cookies (from extension) --------------------
 app.post("/store-cookies", (req, res) => {
   try {
     const { email, cookies, timestamp } = req.body || {};
@@ -423,7 +391,13 @@ app.post("/store-cookies", (req, res) => {
     const insertStmt = db.prepare(
       "INSERT INTO cookies (email, li_at, jsessionid, bcookie, timestamp) VALUES (?, ?, ?, ?, ?)"
     );
-    insertStmt.run(email, cookies.li_at, cookies.JSESSIONID || null, cookies.bcookie || null, timestamp || new Date().toISOString());
+    insertStmt.run(
+      email,
+      cookies.li_at,
+      cookies.JSESSIONID || null,
+      cookies.bcookie || null,
+      timestamp || new Date().toISOString()
+    );
     return res.json({ success: true, message: "Cookies stored successfully." });
   } catch (e) {
     console.error("store-cookies error:", e);
@@ -431,12 +405,9 @@ app.post("/store-cookies", (req, res) => {
   }
 });
 
-// Worker needs li_at for the logged-in user
 app.get("/api/me/liat", authenticateToken, (req, res) => {
   try {
-    const row = db
-      .prepare("SELECT li_at FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1")
-      .get(req.user.email);
+    const row = db.prepare("SELECT li_at FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1").get(req.user.email);
     if (!row || !row.li_at) {
       return res.status(404).json({ success: false, message: "No li_at found for user." });
     }
@@ -447,61 +418,19 @@ app.get("/api/me/liat", authenticateToken, (req, res) => {
   }
 });
 
-// PROTECTED: enqueue SEND_CONNECTION using the latest stored li_at for the logged-in user
-app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) => {
-  try {
-    const email = req.user.email;
-    const { profileUrl, note = null, priority = 3 } = req.body || {};
-    if (!profileUrl) return res.status(400).json({ error: "profileUrl required" });
-
-    const row = db.prepare(
-      "SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1"
-    ).get(email);
-
-    if (!row?.li_at) return res.status(404).json({ error: "No li_at stored. Capture cookies first." });
-
-    const d = await readJobs();
-    const job = {
-      id: uuidv4(),
-      type: "SEND_CONNECTION",
-      payload: {
-        profileUrl,
-        note,
-        cookieBundle: {
-          li_at: row.li_at,
-          jsessionid: row.jsessionid || null,
-          bcookie: row.bcookie || null
-        }
-      },
-      priority,
-      status: "queued",
-      enqueuedAt: new Date().toISOString(),
-      attempts: 0,
-      lastError: null
-    };
-    d.queued.push(job);
-    d.queued.sort((a,b)=>a.priority-b.priority);
-    await writeJobs(d);
-
-    res.json({ ok: true, job });
-  } catch (e) {
-    console.error("enqueue-send-connection error:", e);
-    res.status(500).json({ error: "Failed to enqueue" });
-  }
-});
-
-// ---------- Upload leads from extension (with SalesNav → public URL resolution) ----------
+// -------------------- Upload Leads (extension) --------------------
+// Accepts either { email, leads } OR { userEmail, leads }
 app.post("/upload-leads", async (req, res) => {
   console.log("Received /upload-leads");
-  const { leads, userEmail, timestamp } = req.body || {};
-  if (!userEmail || !Array.isArray(leads) || leads.length === 0) {
-    return res.status(400).json({ success: false, message: "Missing userEmail or leads." });
+  const { leads, email, userEmail, timestamp } = req.body || {};
+  const resolvedEmail = email || userEmail;
+  if (!resolvedEmail || !Array.isArray(leads) || leads.length === 0) {
+    return res.status(400).json({ success: false, message: "Missing email/userEmail or leads." });
   }
 
-  // get li_at for this user (if they clicked "Capture cookies" in the extension)
-  const liAt = getLatestLiAtForUser(userEmail);
+  const liAt = getLatestLiAtForUser(resolvedEmail);
   if (!liAt) {
-    console.warn("[upload-leads] No li_at stored for", userEmail, "- will save Sales Nav URLs as-is.");
+    console.warn("[upload-leads] No li_at stored for", resolvedEmail, "- will save Sales Nav URLs as-is.");
   }
 
   const insertLeadSql = `
@@ -514,7 +443,6 @@ app.post("/upload-leads", async (req, res) => {
 
   let inserted = 0, skipped = 0;
 
-  // Resolve a few leads concurrently but not too many at once (to be gentle)
   const CONCURRENCY = 4;
   const queue = [...leads];
   const workers = [];
@@ -523,11 +451,10 @@ app.post("/upload-leads", async (req, res) => {
     try {
       const fullName = rawLead.full_name || "";
       const firstName = rawLead.first_name || null;
-      const lastName  = rawLead.last_name || null;
+      const lastName  = rawLead.last_name  || null;
       const organization = rawLead.company || null;
       const title = rawLead.title || null;
 
-      // incoming fields from your extension
       let publicUrl = (rawLead.public_linkedin_url && rawLead.public_linkedin_url !== "N/A")
         ? rawLead.public_linkedin_url
         : null;
@@ -535,11 +462,10 @@ app.post("/upload-leads", async (req, res) => {
       let salesNavUrl =
         (rawLead.sales_nav_url && rawLead.sales_nav_url !== "N/A")
           ? rawLead.sales_nav_url
-          : (rawLead.profile_url || null); // some extensions use profile_url for SN URL
+          : (rawLead.profile_url || null); // fallback if extension used profile_url
 
       const profileUrlLegacy = rawLead.profile_url || null;
 
-      // If we don't have a public URL yet, try to resolve from Sales Nav using li_at
       if (!publicUrl && salesNavUrl && liAt) {
         publicUrl = await resolveSalesNavToPublicUrl(salesNavUrl, liAt);
         if (publicUrl) {
@@ -549,32 +475,28 @@ app.post("/upload-leads", async (req, res) => {
         }
       }
 
-      // NEW: if we still don't have a public URL, try to derive it from Sales Nav (heuristic fallback)
+      // Heuristic fallback from Sales Navigator lead URL
       let inferredPublic = null;
-      if (!publicUrl && salesNavUrl && salesNavUrl.includes('/sales/lead/')) {
+      if (!publicUrl && salesNavUrl && salesNavUrl.includes("/sales/lead/")) {
         inferredPublic = derivePublicFromSalesNav(salesNavUrl);
-        if (inferredPublic) {
-          console.log(`[Heuristic] Derived public URL for #${index + 1}: ${inferredPublic}`);
-        }
+        if (inferredPublic) console.log(`[Heuristic] Derived public URL for #${index + 1}: ${inferredPublic}`);
       }
 
-      // choose what to store in public_profile_url
       const public_profile_url_to_store = publicUrl || inferredPublic || null;
 
-      // If we still have neither, we'll still store the SalesNav URL — automation worker will use COALESCE(public_profile_url, profile_url)
       if (!public_profile_url_to_store && !profileUrlLegacy && !salesNavUrl) {
-        console.warn(`[Data Warning] Skipping lead ${index + 1} (no URL fields at all): ${fullName}`);
+        console.warn(`[Data Warning] Skipping lead ${index + 1} (no URL fields): ${fullName}`);
         skipped++;
         return;
       }
 
       const info = insertStmt.run(
-        userEmail,
+        resolvedEmail,
         firstName,
         lastName,
-        profileUrlLegacy,               // profile_url (legacy)
-        public_profile_url_to_store,    // public_profile_url (preferred)
-        salesNavUrl,                    // sales_nav_url
+        profileUrlLegacy,
+        public_profile_url_to_store,
+        salesNavUrl,
         organization,
         title,
         timestamp || new Date().toISOString(),
@@ -588,17 +510,14 @@ app.post("/upload-leads", async (req, res) => {
     }
   }
 
-  // simple concurrency scheduler
   for (let w = 0; w < Math.min(CONCURRENCY, queue.length); w++) {
-    workers.push(
-      (async function runWorker() {
-        while (queue.length) {
-          const idx = leads.length - queue.length; // nice-ish index
-          const next = queue.shift();
-          await processOne(next, idx);
-        }
-      })()
-    );
+    workers.push((async function runWorker() {
+      while (queue.length) {
+        const idx = leads.length - queue.length;
+        const next = queue.shift();
+        await processOne(next, idx);
+      }
+    })());
   }
   await Promise.all(workers);
 
@@ -608,17 +527,14 @@ app.post("/upload-leads", async (req, res) => {
     received: leads.length,
     inserted,
     skipped_duplicates: skipped,
-    user_email: userEmail,
+    user_email: resolvedEmail,
   });
 });
 
-// ---------- Dashboard (protected) ----------
+// -------------------- Dashboard (protected) --------------------
 app.get("/api/leads", authenticateToken, (req, res) => {
-  console.log("Received /api/leads");
   try {
-    const rows = db
-      .prepare("SELECT * FROM leads WHERE user_email = ? ORDER BY scraped_at DESC")
-      .all(req.user.email);
+    const rows = db.prepare("SELECT * FROM leads WHERE user_email = ? ORDER BY scraped_at DESC").all(req.user.email);
     return res.json({ success: true, leads: rows });
   } catch (e) {
     console.error("api/leads error:", e);
@@ -627,15 +543,9 @@ app.get("/api/leads", authenticateToken, (req, res) => {
 });
 
 app.get("/download-leads-excel", authenticateToken, async (req, res) => {
-  console.log("Received /download-leads-excel");
   try {
-    const rows = db
-      .prepare("SELECT * FROM leads WHERE user_email = ? ORDER BY scraped_at DESC")
-      .all(req.user.email);
-
-    if (rows.length === 0) {
-      return res.status(404).send(`No leads found for ${req.user.email}.`);
-    }
+    const rows = db.prepare("SELECT * FROM leads WHERE user_email = ? ORDER BY scraped_at DESC").all(req.user.email);
+    if (rows.length === 0) return res.status(404).send(`No leads found for ${req.user.email}.`);
 
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet("Leads Data");
@@ -662,11 +572,7 @@ app.get("/download-leads-excel", authenticateToken, async (req, res) => {
     rows.forEach(r => ws.addRow(r));
 
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename=linqbridge_leads_${req.user.email.split("@")[0]}_${Date.now()}.xlsx`
-    );
-
+    res.setHeader("Content-Disposition", `attachment; filename=linqbridge_leads_${req.user.email.split("@")[0]}_${Date.now()}.xlsx`);
     await wb.xlsx.write(res);
     res.end();
   } catch (e) {
@@ -675,7 +581,7 @@ app.get("/download-leads-excel", authenticateToken, async (req, res) => {
   }
 });
 
-// ---------- Automation (protected) ----------
+// -------------------- Automation (protected) --------------------
 app.get("/api/automation/get-next-leads", authenticateToken, (req, res) => {
   const limit = parseInt(req.query.limit || "1", 10);
   const email = req.user.email;
@@ -712,9 +618,7 @@ app.get("/api/automation/get-next-leads", authenticateToken, (req, res) => {
   }
 });
 
-// Alias used by worker
 app.get("/api/automation/runner/tick", authenticateToken, (req, res) => {
-  // simply calls the same logic as get-next-leads with limit=1
   try {
     const sel = db.prepare(`
       SELECT id, COALESCE(public_profile_url, profile_url) AS profile_url,
@@ -802,9 +706,7 @@ app.post("/api/automation/update-status", authenticateToken, (req, res) => {
 
   try {
     const info = db.prepare(sql).run(...params);
-    if (info.changes > 0) {
-      return res.json({ success: true, message: "Lead status updated successfully." });
-    }
+    if (info.changes > 0) return res.json({ success: true, message: "Lead status updated successfully." });
     return res.status(404).json({ success: false, message: "Lead not found or not authorized." });
   } catch (e) {
     console.error("update-status error:", e);
@@ -812,15 +714,12 @@ app.post("/api/automation/update-status", authenticateToken, (req, res) => {
   }
 });
 
-// ---------- Root ----------
-app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "dashboard.html"));
+// -------------------- Root (health) --------------------
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("LinqBridge API OK");
 });
 
-// ---------- Start ----------
-app.listen(PORT, '0.0.0.0', () => {
+// -------------------- Start --------------------
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server is running on port ${PORT}`);
-  console.log(
-    `Access your LinqBridge Dashboard at: https://${process.env.REPL_SLUG}.${process.env.REPL_OWNER}.repl.co`
-  );
 });
