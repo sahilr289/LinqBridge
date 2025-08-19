@@ -42,8 +42,8 @@ app.use(express.static("public"));
 // CORS: allow your Chrome extension + optional app origins; handle preflight
 const ALLOWED_ORIGINS = [
   "chrome-extension://mhfjpfanjgflnflifenhoejbfjecleen", // your extension ID
-  "http://localhost:3000",                                // optional: dev dashboard
-  "https://your-dashboard-domain.com"                     // optional: prod dashboard
+  "http://localhost:3000",                                // optional dev dashboard
+  "https://your-dashboard-domain.com"                     // optional prod dashboard
 ];
 app.use(cors({
   origin: (origin, cb) => {
@@ -142,10 +142,11 @@ function getLatestLiAtForUser(email) {
   }
 }
 
+// matches ...fs_salesProfile:12345678  OR  urn:li:fs_salesProfile:(12345678)
 function extractFsSalesProfileId(salesNavUrl = "") {
   const m =
-    salesNavUrl.match(/fs_salesProfile:(\\d+)/) ||
-    salesNavUrl.match(/fs_salesProfile:\\((\\d+)\\)/);
+    salesNavUrl.match(/fs_salesProfile:(\d+)/) ||
+    salesNavUrl.match(/fs_salesProfile:\((\d+)\)/);
   return m ? m[1] : null;
 }
 
@@ -194,11 +195,11 @@ async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
 
 async function safeText(res) { try { return await res.text(); } catch { return ""; } }
 
+// e.g. /sales/lead/ACwAA... -> https://www.linkedin.com/in/ACwAA...
 function derivePublicFromSalesNav(salesNavUrl) {
   if (!salesNavUrl) return null;
-  const m = salesNavUrl.match(/\\/sales\\/lead\\/([^,\\/\\?]+)/i);
-  if (m && m[1]) return `https://www.linkedin.com/in/${m[1]}`;
-  return null;
+  const m = salesNavUrl.match(/\/sales\/lead\/([^,\/\?]+)/i);
+  return m && m[1] ? `https://www.linkedin.com/in/${m[1]}` : null;
 }
 
 // -------------------- Auth --------------------
