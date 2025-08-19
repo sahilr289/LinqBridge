@@ -36,9 +36,9 @@
     <!-- App -->
     <div id="app" class="card" style="display:none;">
       <div class="toolbar">
-        <div>
-          <button id="reload-btn" class="btn">Reload Leads</button>
-          <button id="download-btn" class="btn">Download Excel</button>
+        <div class="left app-tabs">
+          <button id="app-tab-leads" class="tab active">Leads</button>
+          <button id="app-tab-connection" class="tab">Connect LinkedIn</button>
         </div>
         <div class="right">
           <span id="whoami"></span>
@@ -48,20 +48,60 @@
 
       <div id="app-msg" class="msg" style="display:none;"></div>
 
-      <table id="leads-table">
-        <thead>
-        <tr>
-          <th>First</th>
-          <th>Last</th>
-          <th>Organization</th>
-          <th>Title</th>
-          <th>Public URL</th>
-          <th>Sales Nav URL</th>
-          <th>Status</th>
-        </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
+      <!-- Leads view -->
+      <div id="view-leads" class="app-view view-active">
+        <div class="toolbar">
+          <div>
+            <button id="reload-btn" class="btn">Reload Leads</button>
+            <button id="download-btn" class="btn">Download Excel</button>
+          </div>
+        </div>
+
+        <table id="leads-table">
+          <thead>
+          <tr>
+            <th>First</th>
+            <th>Last</th>
+            <th>Organization</th>
+            <th>Title</th>
+            <th>Public URL</th>
+            <th>Sales Nav URL</th>
+            <th>Status</th>
+          </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <!-- Connect LinkedIn view -->
+      <div id="view-connection" class="app-view" style="display:none;">
+        <div class="section">
+          <h3>Connect your profile</h3>
+          <p>
+            Make sure you’ve clicked <em>Capture Cookies</em> in the Chrome extension so the server has your
+            <code>li_at</code>, <code>JSESSIONID</code>, and <code>bcookie</code>. Then press **Check Connection**.
+          </p>
+          <button id="check-conn-btn" class="btn primary">Check Connection</button>
+          <span id="conn-status" class="badge" style="margin-left:10px;"></span>
+          <div id="conn-msg" class="msg" style="display:none; margin-top:10px;"></div>
+        </div>
+
+        <div class="section">
+          <h3>Recent connection logs</h3>
+          <button id="reload-logs-btn" class="btn">Reload Logs</button>
+          <table id="logs-table" style="margin-top:10px; width:100%;">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Level</th>
+                <th>Event</th>
+                <th>Details</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
     </div>
   </div>
 
