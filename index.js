@@ -1,4 +1,4 @@
-// index.js — LinqBridge backend (Auth + Leads + Automation) FINAL
+// index.js — LinqBridge backend (Auth + Leads + Automation) + Connection Status
 
 // --- Core Modules ---
 const express = require("express");
@@ -17,12 +17,9 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // SECURITY: Use environment variable for JWT secret. The fallback is for local dev only.
-// In a production environment, this variable MUST be set.
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key_change_this_for_prod";
 
 // --- Job Queue (file-backed) ---
-// Note: A file-backed queue is simple but not atomic. For high-volume or critical
-// production use, consider a robust message broker like Redis or RabbitMQ.
 const DATA_DIR = path.join(__dirname, "data");
 const JOBS_FILE = path.join(DATA_DIR, "jobs.json");
 
@@ -40,7 +37,6 @@ async function writeJobs(d) { return fs.writeJson(JOBS_FILE, d, { spaces: 2 }); 
 // Worker-only authentication middleware.
 function requireWorkerAuth(req, res, next) {
   const header = req.get("x-worker-secret");
-  // The worker secret MUST be set in an environment variable for security.
   if (!header || header !== process.env.WORKER_SHARED_SECRET) {
     return res.status(401).json({ error: "Unauthorized" });
   }
@@ -127,6 +123,18 @@ function initializeDatabase() {
     );
   `);
 
+  // NEW: connection logs table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS connection_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_email TEXT NOT NULL,
+      level TEXT NOT NULL,           -- info | warn | error
+      event TEXT NOT NULL,           -- cookies_saved | status_ok | status_fail | ...
+      details TEXT,                  -- JSON/string
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
   // Partial UNIQUE indexes enforce per-user uniqueness.
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_unique_public
@@ -141,12 +149,24 @@ function initializeDatabase() {
   `);
 
   console.log(
-    "Database initialized: Leads, Message Templates, Users, Cookies, and unique indexes ready."
+    "Database initialized: Leads, Message Templates, Users, Cookies, Connection Logs, and unique indexes ready."
   );
 }
 initializeDatabase();
 
 // --- Helper Functions ---
+function logConn(email, level, event, detailsObj) {
+  try {
+    const stmt = db.prepare(`
+      INSERT INTO connection_logs (user_email, level, event, details)
+      VALUES (?, ?, ?, ?)
+    `);
+    stmt.run(email, level, event, detailsObj ? JSON.stringify(detailsObj) : null);
+  } catch (e) {
+    console.warn("logConn error:", e.message);
+  }
+}
+
 // Get latest 'li_at' cookie for a user.
 function getLatestLiAtForUser(email) {
   try {
@@ -168,8 +188,7 @@ function extractFsSalesProfileId(salesNavUrl = "") {
   return m ? m[1] : null;
 }
 
-// Attempts to resolve a Sales Nav URL to a public URL. This relies on an undocumented
-// LinkedIn API and may break if LinkedIn changes their API.
+// Resolve Sales Nav URL → public URL (best-effort; LI may change this)
 async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
   if (!salesNavUrl || !liAtCookie) return null;
   const profileId = extractFsSalesProfileId(salesNavUrl);
@@ -186,7 +205,6 @@ async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
         "csrf-token": "ajax:123456789",
         "cookie": `li_at=${liAtCookie};`
       },
-      // Timeout using the modern AbortController pattern.
       signal: AbortSignal.timeout ? AbortSignal.timeout(12_000) : undefined
     });
 
@@ -433,7 +451,21 @@ app.post("/store-cookies", (req, res) => {
     const insertStmt = db.prepare(
       "INSERT INTO cookies (email, li_at, jsessionid, bcookie, timestamp) VALUES (?, ?, ?, ?, ?)"
     );
-    insertStmt.run(email, cookies.li_at, cookies.JSESSIONID || null, cookies.bcookie || null, timestamp || new Date().toISOString());
+    insertStmt.run(
+      email,
+      cookies.li_at,
+      cookies.JSESSIONID || null,
+      cookies.bcookie || null,
+      timestamp || new Date().toISOString()
+    );
+
+    // NEW: log event
+    logConn(email, "info", "cookies_saved", {
+      has_li_at: !!cookies.li_at,
+      has_jsessionid: !!cookies.JSESSIONID,
+      has_bcookie: !!cookies.bcookie
+    });
+
     return res.json({ success: true, message: "Cookies stored successfully." });
   } catch (e) {
     console.error("store-cookies error:", e);
@@ -681,7 +713,6 @@ app.get("/api/automation/get-next-leads", authenticateToken, (req, res) => {
 
   try {
     let leads = [];
-    // Use a transaction for atomicity.
     db.transaction(() => {
       const sel = db.prepare(`
         SELECT id, COALESCE(public_profile_url, profile_url) AS profile_url,
@@ -807,6 +838,87 @@ app.post("/api/automation/update-status", authenticateToken, (req, res) => {
   } catch (e) {
     console.error("update-status error:", e);
     return res.status(500).json({ success: false, message: "Internal server error updating lead status." });
+  }
+});
+
+// --- Connection Status Endpoints (NEW) ---
+app.get("/api/connection/check", authenticateToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+    const row = db.prepare(
+      "SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1"
+    ).get(email);
+
+    if (!row?.li_at) {
+      logConn(email, "warn", "status_fail", { reason: "no_li_at" });
+      return res.json({
+        connected: false,
+        reason: "No li_at cookie on server. Capture cookies from the extension."
+      });
+    }
+
+    const url = "https://www.linkedin.com/voyager/api/me";
+    try {
+      const resp = await fetch(url, {
+        headers: {
+          "accept": "application/json",
+          "csrf-token": "ajax:123456789",
+          "cookie": `li_at=${row.li_at};`
+        },
+        signal: (typeof AbortSignal !== "undefined" && AbortSignal.timeout)
+          ? AbortSignal.timeout(8000)
+          : undefined
+      });
+
+      if (!resp.ok) {
+        let body = "";
+        try { body = await resp.text(); } catch {}
+        logConn(email, "warn", "status_fail", { http: resp.status, body });
+        return res.json({ connected: false, reason: `HTTP ${resp.status}` });
+      }
+
+      let data = {};
+      try { data = await resp.json(); } catch {}
+      const name =
+        (data?.miniProfile?.firstName && data?.miniProfile?.lastName)
+          ? `${data.miniProfile.firstName} ${data.miniProfile.lastName}`
+          : (data?.firstName && data?.lastName ? `${data.firstName} ${data.lastName}` : null);
+
+      logConn(email, "info", "status_ok", { name });
+      return res.json({ connected: true, name: name || null });
+    } catch (e) {
+      logConn(email, "error", "status_fail", { error: e.message });
+      return res.json({ connected: false, reason: "network_error" });
+    }
+  } catch (e) {
+    console.error("/api/connection/check error:", e);
+    return res.status(500).json({ connected: false, reason: "server_error" });
+  }
+});
+
+app.get("/api/connection/logs", authenticateToken, (req, res) => {
+  const email = req.user.email;
+  const limit = Math.min(parseInt(req.query.limit || "25", 10), 100);
+  try {
+    const rows = db.prepare(`
+      SELECT level, event, details, created_at
+      FROM connection_logs
+      WHERE user_email = ?
+      ORDER BY id DESC
+      LIMIT ?;
+    `).all(email, limit);
+
+    const logs = rows.map(r => ({
+      level: r.level,
+      event: r.event,
+      details: (() => { try { return JSON.parse(r.details); } catch { return r.details; } })(),
+      at: r.created_at
+    }));
+
+    res.json({ success: true, logs });
+  } catch (e) {
+    console.error("/api/connection/logs error:", e);
+    res.status(500).json({ success: false, logs: [] });
   }
 });
 
