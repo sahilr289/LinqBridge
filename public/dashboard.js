@@ -1,189 +1,271 @@
-// Persist token in localStorage between refreshes
-let token = localStorage.getItem("linqbridge_token") || null;
-let emailCache = localStorage.getItem("linqbridge_email") || null;
+// dashboard.js — LinqBridge Dashboard (Leads + Connect LinkedIn)
 
-const el = (id) => document.getElementById(id);
-const show = (node, on = true) => (node.style.display = on ? "" : "none");
-const setMsg = (node, text, isError = false) => {
-  node.textContent = text;
-  node.className = "msg" + (isError ? " error" : "");
-  show(node, !!text);
-};
+const API_BASE = ""; // same-origin (Railway domain serves this file)
+const LS_TOKEN = "lb_token";
+const LS_EMAIL = "lb_email";
 
-function switchTab(to) {
-  const isLogin = to === "login";
-  el("tab-login").classList.toggle("active", isLogin);
-  el("tab-register").classList.toggle("active", !isLogin);
-  el("login-form").classList.toggle("form-active", isLogin);
-  el("register-form").classList.toggle("form-active", !isLogin);
-  setMsg(el("auth-msg"), "");
+// ---------- tiny helpers ----------
+function $(id) { return document.getElementById(id); }
+function show(el) { el && (el.style.display = "block"); }
+function hide(el) { el && (el.style.display = "none"); }
+function setText(el, txt) { el && (el.textContent = txt); }
+
+function setMsg(el, text, type="info") {
+  if (!el) return;
+  el.className = "msg " + type;
+  el.textContent = text;
+  show(el);
 }
 
-el("tab-login").addEventListener("click", () => switchTab("login"));
-el("tab-register").addEventListener("click", () => switchTab("register"));
-
-async function login(email, password) {
-  const r = await fetch("/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password }),
+async function api(path, { method = "GET", headers = {}, body } = {}) {
+  const token = localStorage.getItem(LS_TOKEN);
+  const finalHeaders = {
+    "Content-Type": "application/json",
+    ...(token ? { "Authorization": `Bearer ${token}` } : {}),
+    ...headers
+  };
+  const res = await fetch(path.startsWith("/") ? API_BASE + path : API_BASE + "/" + path, {
+    method,
+    headers: finalHeaders,
+    body
   });
-  const j = await r.json();
-  if (!r.ok || !j.success) throw new Error(j.message || "Login failed");
-  token = j.token;
-  emailCache = j.userEmail || email;
-  localStorage.setItem("linqbridge_token", token);
-  localStorage.setItem("linqbridge_email", emailCache);
-}
-
-async function register(email, password) {
-  const r = await fetch("/register", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password }),
-  });
-  const j = await r.json();
-  if (!r.ok || !j.success) throw new Error(j.message || "Register failed");
-}
-
-async function fetchLeads() {
-  const r = await fetch("/api/leads", {
-    headers: { Authorization: "Bearer " + token },
-  });
-  if (r.status === 401 || r.status === 403) {
-    throw new Error("Unauthorized. Please log in again.");
+  const ct = res.headers.get("content-type") || "";
+  const text = await res.text();
+  if (!ct.includes("application/json")) {
+    // allow file downloads to pass through this helper as non-json
+    return { _raw: text, _status: res.status };
   }
-  const j = await r.json();
-  if (!j.success) throw new Error(j.message || "Failed to fetch leads");
-  return j.leads || [];
+  const json = JSON.parse(text);
+  if (!res.ok) throw new Error(json.message || `HTTP ${res.status}`);
+  return json;
 }
 
-function renderLeads(leads) {
-  const tbody = document.querySelector("#leads-table tbody");
+// ---------- auth wiring ----------
+function switchAuthTab(tab) {
+  const loginTab = $("tab-login"), regTab = $("tab-register");
+  const loginForm = $("login-form"), regForm = $("register-form");
+  if (tab === "login") {
+    loginTab.classList.add("active"); regTab.classList.remove("active");
+    loginForm.classList.add("form-active"); regForm.classList.remove("form-active");
+  } else {
+    regTab.classList.add("active"); loginTab.classList.remove("active");
+    regForm.classList.add("form-active"); loginForm.classList.remove("form-active");
+  }
+}
+
+async function doLogin() {
+  const email = $("login-email").value.trim();
+  const password = $("login-password").value;
+  const msg = $("auth-msg");
+
+  if (!email || !password) return setMsg(msg, "Enter email and password.", "error");
+
+  try {
+    const data = await api("/login", {
+      method: "POST",
+      body: JSON.stringify({ email, password })
+    });
+    localStorage.setItem(LS_TOKEN, data.token);
+    localStorage.setItem(LS_EMAIL, data.userEmail);
+    setMsg(msg, "Logged in!", "success");
+    showApp();
+  } catch (e) {
+    setMsg(msg, e.message || "Login failed.", "error");
+  }
+}
+
+async function doRegister() {
+  const email = $("reg-email").value.trim();
+  const p1 = $("reg-password").value;
+  const p2 = $("reg-password2").value;
+  const msg = $("auth-msg");
+  if (!email || !p1 || !p2) return setMsg(msg, "Fill all fields.", "error");
+  if (p1 !== p2) return setMsg(msg, "Passwords do not match.", "error");
+
+  try {
+    await api("/register", {
+      method: "POST",
+      body: JSON.stringify({ email, password: p1 })
+    });
+    setMsg(msg, "Account created. You can log in now.", "success");
+    switchAuthTab("login");
+  } catch (e) {
+    setMsg(msg, e.message || "Register failed.", "error");
+  }
+}
+
+function logout() {
+  localStorage.removeItem(LS_TOKEN);
+  localStorage.removeItem(LS_EMAIL);
+  $("whoami").textContent = "";
+  hide($("app"));
+  show($("auth-card"));
+}
+
+// ---------- views (tabs inside app) ----------
+function switchAppView(view) {
+  const leadsBtn = $("app-tab-leads");
+  const connBtn  = $("app-tab-connection");
+  const leads    = $("view-leads");
+  const conn     = $("view-connection");
+
+  if (view === "leads") {
+    leadsBtn.classList.add("active"); connBtn.classList.remove("active");
+    leads.classList.add("view-active"); leads.style.display = "block";
+    conn.classList.remove("view-active"); conn.style.display = "none";
+  } else {
+    connBtn.classList.add("active"); leadsBtn.classList.remove("active");
+    conn.classList.add("view-active"); conn.style.display = "block";
+    leads.classList.remove("view-active"); leads.style.display = "none";
+  }
+}
+
+// ---------- leads ----------
+async function loadLeads() {
+  const msg = $("app-msg");
+  try {
+    const data = await api("/api/leads");
+    renderLeadsTable(data.leads || []);
+    hide(msg);
+  } catch (e) {
+    setMsg(msg, e.message || "Failed to load leads.", "error");
+  }
+}
+
+function renderLeadsTable(rows) {
+  const tbody = $("leads-table").querySelector("tbody");
   tbody.innerHTML = "";
-  for (const lead of leads) {
+  rows.forEach(r => {
     const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${lead.first_name || ""}</td>
-      <td>${lead.last_name || ""}</td>
-      <td>${lead.organization || ""}</td>
-      <td>${lead.title || ""}</td>
-      <td>${(lead.public_profile_url || lead.profile_url) ? `<a href="${lead.public_profile_url || lead.profile_url}" target="_blank">Profile</a>` : ""}</td>
-      <td>${lead.sales_nav_url ? `<a href="${lead.sales_nav_url}" target="_blank">SalesNav</a>` : ""}</td>
-      <td>${lead.automation_status || ""}</td>
-    `;
+    const td = (v) => {
+      const t = document.createElement("td");
+      if (typeof v === "string" && v.startsWith("http")) {
+        const a = document.createElement("a");
+        a.href = v; a.target = "_blank"; a.textContent = v;
+        t.appendChild(a);
+      } else {
+        t.textContent = v ?? "";
+      }
+      return t;
+    };
+    tr.appendChild(td(r.first_name));
+    tr.appendChild(td(r.last_name));
+    tr.appendChild(td(r.organization));
+    tr.appendChild(td(r.title));
+    tr.appendChild(td(r.public_profile_url));
+    tr.appendChild(td(r.sales_nav_url || r.profile_url));
+    tr.appendChild(td(r.automation_status));
     tbody.appendChild(tr);
-  }
+  });
 }
 
 async function downloadExcel() {
-  // We’ll fetch with Authorization, then create a blob download
-  const r = await fetch("/download-leads-excel", {
-    headers: { Authorization: "Bearer " + token },
+  const token = localStorage.getItem(LS_TOKEN);
+  const res = await fetch("/download-leads-excel", {
+    method: "GET",
+    headers: { "Authorization": `Bearer ${token}` }
   });
-  if (!r.ok) {
-    const txt = await r.text();
-    throw new Error(`Download failed: ${txt || r.status}`);
+  if (!res.ok) {
+    setMsg($("app-msg"), `Download failed (HTTP ${res.status})`, "error");
+    return;
   }
-  const blob = await r.blob();
+  const blob = await res.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  const who = (emailCache || "me").split("@")[0];
-  a.download = `linqbridge_leads_${who}_${Date.now()}.xlsx`;
+  a.download = `linqbridge_leads_${(localStorage.getItem(LS_EMAIL)||"me").split("@")[0]}_${Date.now()}.xlsx`;
   document.body.appendChild(a);
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
 }
 
-function logout() {
-  token = null;
-  emailCache = null;
-  localStorage.removeItem("linqbridge_token");
-  localStorage.removeItem("linqbridge_email");
-  show(el("app"), false);
-  show(el("auth-card"), true);
-  switchTab("login");
+// ---------- connection ----------
+async function checkConnection() {
+  const status = $("conn-status");
+  const msg = $("conn-msg");
+  setText(status, "Checking…");
+  status.className = "badge";
+  hide(msg);
+  try {
+    const data = await api("/api/connection/check");
+    if (data.connected) {
+      status.className = "badge ok";
+      setText(status, data.name ? `Connected as ${data.name}` : "Connected");
+      setMsg(msg, "Your cookies are valid. Worker can send connection requests.", "success");
+    } else {
+      status.className = "badge fail";
+      setText(status, "Not connected");
+      setMsg(msg, data.reason || "Not connected.", "error");
+    }
+  } catch (e) {
+    status.className = "badge fail";
+    setText(status, "Error");
+    setMsg(msg, e.message || "Failed to check status.", "error");
+  }
 }
 
-// UI events
-el("login-btn").addEventListener("click", async () => {
-  const email = el("login-email").value.trim();
-  const pass = el("login-password").value;
-  setMsg(el("auth-msg"), "Logging in…");
+async function loadLogs() {
+  const tbody = $("logs-table").querySelector("tbody");
+  tbody.innerHTML = "";
   try {
-    await login(email, pass);
-    setMsg(el("auth-msg"), "");
-    show(el("auth-card"), false);
-    show(el("app"), true);
-    el("whoami").textContent = emailCache;
-    setMsg(el("app-msg"), "Loading leads…");
-    const leads = await fetchLeads();
-    renderLeads(leads);
-    setMsg(el("app-msg"), `Loaded ${leads.length} lead(s).`);
+    const data = await api("/api/connection/logs?limit=50");
+    (data.logs || []).forEach(log => {
+      const tr = document.createElement("tr");
+      const td = (v) => { const t = document.createElement("td"); t.textContent = v ?? ""; return t; };
+      tr.appendChild(td(new Date(log.at).toLocaleString()));
+      tr.appendChild(td(log.level));
+      tr.appendChild(td(log.event));
+      tr.appendChild(td(typeof log.details === "object" ? JSON.stringify(log.details) : (log.details || "")));
+      tbody.appendChild(tr);
+    });
   } catch (e) {
-    setMsg(el("auth-msg"), e.message, true);
+    setMsg($("conn-msg"), e.message || "Failed to load logs.", "error");
+  }
+}
+
+// ---------- app show/hide ----------
+function showApp() {
+  const email = localStorage.getItem(LS_EMAIL) || "";
+  setText($("whoami"), email ? `Logged in as ${email}` : "");
+  hide($("auth-card"));
+  show($("app"));
+  switchAppView("leads");
+  loadLeads();
+}
+
+// ---------- event wiring ----------
+document.addEventListener("DOMContentLoaded", () => {
+  // auth tab buttons
+  $("tab-login").addEventListener("click", () => switchAuthTab("login"));
+  $("tab-register").addEventListener("click", () => switchAuthTab("register"));
+
+  // auth actions
+  $("login-btn").addEventListener("click", doLogin);
+  $("register-btn").addEventListener("click", doRegister);
+  $("logout-btn").addEventListener("click", logout);
+
+  // app tab buttons
+  $("app-tab-leads").addEventListener("click", () => switchAppView("leads"));
+  $("app-tab-connection").addEventListener("click", () => {
+    switchAppView("connection");
+    // auto-refresh status & logs when opening the tab
+    checkConnection();
+    loadLogs();
+  });
+
+  // leads actions
+  $("reload-btn").addEventListener("click", loadLeads);
+  $("download-btn").addEventListener("click", downloadExcel);
+
+  // connection actions
+  $("check-conn-btn").addEventListener("click", checkConnection);
+  $("reload-logs-btn").addEventListener("click", loadLogs);
+
+  // autologin if token exists
+  if (localStorage.getItem(LS_TOKEN)) {
+    showApp();
+  } else {
+    show($("auth-card"));
   }
 });
-
-el("register-btn").addEventListener("click", async () => {
-  const email = el("reg-email").value.trim();
-  const p1 = el("reg-password").value;
-  const p2 = el("reg-password2").value;
-  if (!email || !p1)
-    return setMsg(el("auth-msg"), "Email & password required", true);
-  if (p1 !== p2) return setMsg(el("auth-msg"), "Passwords do not match", true);
-
-  setMsg(el("auth-msg"), "Creating account…");
-  try {
-    await register(email, p1);
-    setMsg(el("auth-msg"), "Account created. You can log in now.");
-    switchTab("login");
-    el("login-email").value = email;
-    el("login-password").focus();
-  } catch (e) {
-    setMsg(el("auth-msg"), e.message, true);
-  }
-});
-
-el("reload-btn").addEventListener("click", async () => {
-  try {
-    setMsg(el("app-msg"), "Refreshing…");
-    const leads = await fetchLeads();
-    renderLeads(leads);
-    setMsg(el("app-msg"), `Loaded ${leads.length} lead(s).`);
-  } catch (e) {
-    setMsg(el("app-msg"), e.message, true);
-  }
-});
-
-el("download-btn").addEventListener("click", async () => {
-  try {
-    setMsg(el("app-msg"), "Preparing download…");
-    await downloadExcel();
-    setMsg(el("app-msg"), "Download started.");
-  } catch (e) {
-    setMsg(el("app-msg"), e.message, true);
-  }
-});
-
-el("logout-btn").addEventListener("click", logout);
-
-// Auto-log in if token exists
-(async function boot() {
-  if (token) {
-    try {
-      show(el("auth-card"), false);
-      show(el("app"), true);
-      el("whoami").textContent = emailCache || "";
-      setMsg(el("app-msg"), "Loading leads…");
-      const leads = await fetchLeads();
-      renderLeads(leads);
-      setMsg(el("app-msg"), `Loaded ${leads.length} lead(s).`);
-    } catch (e) {
-      // token likely invalid/expired
-      logout();
-    }
-  }
-})();
