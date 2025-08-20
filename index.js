@@ -1,6 +1,5 @@
-// index.js — LinqBridge backend (FINAL, logs + robust CORS + fixed CSRF)
+// index.js — LinqBridge backend (FINAL, soft/live connection check + logs, robust CORS)
 
-// --- Core Modules ---
 const express = require("express");
 const cors = require("cors");
 const Database = require("better-sqlite3");
@@ -12,7 +11,7 @@ const fs = require("fs-extra");
 const { v4: uuidv4 } = require("uuid");
 require("dotenv").config();
 
-// --- Server Setup ---
+// --- Server ---
 const app = express();
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key_change_this_for_prod";
@@ -52,7 +51,7 @@ const ALLOWED_ORIGINS = new Set([
 ]);
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || ALLOWED_ORIGINS.has(origin)) return cb(null, true); // allow Postman/curl (no origin)
+    if (!origin || ALLOWED_ORIGINS.has(origin)) return cb(null, true); // allow curl/postman (no origin)
     return cb(new Error(`Origin ${origin} not allowed by CORS`));
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -61,7 +60,7 @@ app.use(cors({
 }));
 app.options("*", cors());
 
-// --- DB Initialization ---
+// --- DB ---
 const dbPath = path.join(__dirname, "linqbridge.db");
 const db = new Database(dbPath, { verbose: console.log });
 
@@ -126,7 +125,7 @@ function initializeDatabase() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_email TEXT NOT NULL,
       level TEXT NOT NULL,      -- info | warn | error
-      event TEXT NOT NULL,      -- cookies_saved | status_ok | status_fail
+      event TEXT NOT NULL,      -- cookies_saved | status_soft_ok | status_live_ok | status_fail
       details TEXT,             -- JSON/string
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
@@ -162,9 +161,7 @@ function logConn(email, level, event, detailsObj) {
 
 function getLatestLiAtForUser(email) {
   try {
-    const row = db
-      .prepare("SELECT li_at FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1")
-      .get(email);
+    const row = db.prepare("SELECT li_at FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1").get(email);
     return row?.li_at || null;
   } catch (e) {
     console.error("getLatestLiAtForUser error:", e);
@@ -172,21 +169,8 @@ function getLatestLiAtForUser(email) {
   }
 }
 
-function getLatestCookieRow(email) {
-  try {
-    return db
-      .prepare("SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1")
-      .get(email) || null;
-  } catch (e) {
-    console.error("getLatestCookieRow error:", e);
-    return null;
-  }
-}
-
 function extractFsSalesProfileId(salesNavUrl = "") {
-  const m =
-    salesNavUrl.match(/fs_salesProfile:(\d+)/) ||
-    salesNavUrl.match(/fs_salesProfile:\((\d+)\)/);
+  const m = salesNavUrl.match(/fs_salesProfile:(\d+)/) || salesNavUrl.match(/fs_salesProfile:\((\d+)\)/);
   return m ? m[1] : null;
 }
 
@@ -216,9 +200,7 @@ async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
       data?.profile?.profileUrl,
       data?.profile?.profileUrn,
       data?.publicProfileUrl,
-      data?.profile?.publicIdentifier
-        ? `https://www.linkedin.com/in/${data.profile.publicIdentifier}`
-        : null,
+      data?.profile?.publicIdentifier ? `https://www.linkedin.com/in/${data.profile.publicIdentifier}` : null,
     ].filter(Boolean);
     return candidates[0] || null;
   } catch (e) {
@@ -227,9 +209,7 @@ async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
   }
 }
 
-async function safeText(res) {
-  try { return await res.text(); } catch { return ""; }
-}
+async function safeText(res) { try { return await res.text(); } catch { return ""; } }
 
 function derivePublicFromSalesNav(salesNavUrl) {
   if (!salesNavUrl) return null;
@@ -253,9 +233,7 @@ function authenticateToken(req, res, next) {
 // --- Auth Endpoints ---
 app.post("/register", async (req, res) => {
   const { email, password } = req.body || {};
-  if (!email || !password) {
-    return res.status(400).json({ success: false, message: "Email and password are required." });
-  }
+  if (!email || !password) return res.status(400).json({ success: false, message: "Email and password are required." });
   try {
     const hashed = await bcrypt.hash(password, 10);
     const info = db.prepare("INSERT INTO users (email, password) VALUES (?, ?)").run(email, hashed);
@@ -269,9 +247,7 @@ app.post("/register", async (req, res) => {
 
 app.post("/login", async (req, res) => {
   const { email, password } = req.body || {};
-  if (!email || !password) {
-    return res.status(400).json({ success: false, message: "Email and password are required." });
-  }
+  if (!email || !password) return res.status(400).json({ success: false, message: "Email and password are required." });
   try {
     const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
     if (!user) return res.status(401).json({ success: false, message: "Invalid credentials." });
@@ -290,7 +266,6 @@ app.post("/jobs", async (req, res) => {
   try {
     const { type, payload, priority = 5 } = req.body || {};
     if (!type) return res.status(400).json({ error: "Missing job 'type'." });
-
     const job = {
       id: uuidv4(),
       type,
@@ -301,7 +276,6 @@ app.post("/jobs", async (req, res) => {
       attempts: 0,
       lastError: null,
     };
-
     const d = await readJobs();
     d.queued.push(job);
     d.queued.sort((a, b) => a.priority - b.priority);
@@ -317,16 +291,13 @@ app.post("/jobs/next", requireWorkerAuth, async (req, res) => {
   try {
     const { types } = req.body || {};
     const d = await readJobs();
-
     let idx = -1;
     if (Array.isArray(types) && types.length) {
       idx = d.queued.findIndex(j => types.includes(j.type));
     } else {
       idx = d.queued.length ? 0 : -1;
     }
-
     if (idx === -1) return res.json({ ok: true, job: null });
-
     const job = d.queued.splice(idx, 1)[0];
     job.status = "active";
     job.attempts += 1;
@@ -345,10 +316,8 @@ app.post("/jobs/:id/complete", requireWorkerAuth, async (req, res) => {
     const { id } = req.params;
     const { result } = req.body || {};
     const d = await readJobs();
-
     const i = d.active.findIndex(j => j.id === id);
     if (i === -1) return res.status(404).json({ error: "Active job not found" });
-
     const job = d.active.splice(i, 1)[0];
     job.status = "done";
     job.completedAt = new Date().toISOString();
@@ -367,15 +336,12 @@ app.post("/jobs/:id/fail", requireWorkerAuth, async (req, res) => {
     const { id } = req.params;
     const { error, requeue = false, delayMs = 0 } = req.body || {};
     const d = await readJobs();
-
     const i = d.active.findIndex(j => j.id === id);
     if (i === -1) return res.status(404).json({ error: "Active job not found" });
-
     const job = d.active.splice(i, 1)[0];
     job.status = "failed";
     job.lastError = error || "Unknown";
     job.failedAt = new Date().toISOString();
-
     if (requeue) {
       job.status = "queued";
       delete job.startedAt;
@@ -393,7 +359,6 @@ app.post("/jobs/:id/fail", requireWorkerAuth, async (req, res) => {
     } else {
       d.failed.push(job);
     }
-
     await writeJobs(d);
     res.json({ ok: true, job });
   } catch (e) {
@@ -404,36 +369,28 @@ app.post("/jobs/:id/fail", requireWorkerAuth, async (req, res) => {
 
 app.get("/jobs/stats", async (_req, res) => {
   const d = await readJobs();
-  res.json({
-    counts: { queued: d.queued.length, active: d.active.length, done: d.done.length, failed: d.failed.length },
-  });
+  res.json({ counts: { queued: d.queued.length, active: d.active.length, done: d.done.length, failed: d.failed.length } });
 });
 
 // --- Cookies from extension ---
 app.post("/store-cookies", (req, res) => {
   try {
     const body = req.body || {};
-    const email = body.userEmail || body.email; // accept either
+    const email = body.userEmail || body.email;       // accept userEmail OR email
     const cookies = body.cookies || {};
     const timestamp = body.timestamp || new Date().toISOString();
-
     if (!email || !cookies.li_at) {
       return res.status(400).json({ success: false, message: "Missing email or li_at cookie." });
     }
-
-    // sanitize JSESSIONID (store unquoted)
-    let jsid = cookies.JSESSIONID || null;
-    if (jsid && /^".*"$/.test(jsid)) jsid = jsid.slice(1, -1);
-
     db.prepare(`
       INSERT INTO cookies (email, li_at, jsessionid, bcookie, timestamp)
       VALUES (?, ?, ?, ?, ?)
-    `).run(email, cookies.li_at, jsid, cookies.bcookie || null, timestamp);
+    `).run(email, cookies.li_at, cookies.JSESSIONID || null, cookies.bcookie || null, timestamp);
 
     logConn(email, "info", "cookies_saved", {
       has_li_at: !!cookies.li_at,
-      has_jsessionid: !!jsid,
-      has_bcookie: !!cookies.bcookie,
+      has_jsessionid: !!cookies.JSESSIONID,
+      has_bcookie: !!cookies.bcookie
     });
 
     return res.json({ success: true, message: "Cookies stored successfully." });
@@ -443,12 +400,9 @@ app.post("/store-cookies", (req, res) => {
   }
 });
 
-// Latest li_at for the logged-in user
 app.get("/api/me/liat", authenticateToken, (req, res) => {
   try {
-    const row = db
-      .prepare("SELECT li_at FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1")
-      .get(req.user.email);
+    const row = db.prepare("SELECT li_at FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1").get(req.user.email);
     if (!row?.li_at) return res.status(404).json({ success: false, message: "No li_at found for user." });
     return res.json({ success: true, li_at: row.li_at });
   } catch (e) {
@@ -457,14 +411,15 @@ app.get("/api/me/liat", authenticateToken, (req, res) => {
   }
 });
 
-// Enqueue SEND_CONNECTION job
 app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
     const { profileUrl, note = null, priority = 3 } = req.body || {};
     if (!profileUrl) return res.status(400).json({ error: "profileUrl required" });
 
-    const row = getLatestCookieRow(email);
+    const row = db.prepare(
+      "SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1"
+    ).get(email);
     if (!row?.li_at) return res.status(404).json({ error: "No li_at stored. Capture cookies first." });
 
     const d = await readJobs();
@@ -496,16 +451,13 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
 app.post("/upload-leads", async (req, res) => {
   console.log("Received /upload-leads");
   const { leads, timestamp } = req.body || {};
-  const userEmail = req.body.userEmail || req.body.email; // robust
-
+  const userEmail = req.body.userEmail || req.body.email;
   if (!userEmail || !Array.isArray(leads) || leads.length === 0) {
     return res.status(400).json({ success: false, message: "Missing userEmail or leads." });
   }
 
   const liAt = getLatestLiAtForUser(userEmail);
-  if (!liAt) {
-    console.warn("[upload-leads] No li_at stored for", userEmail, "- will save Sales Nav URLs as-is.");
-  }
+  if (!liAt) console.warn("[upload-leads] No li_at stored for", userEmail, "- will save Sales Nav URLs as-is.");
 
   const insertLeadSql = `
     INSERT OR IGNORE INTO leads
@@ -542,7 +494,6 @@ app.post("/upload-leads", async (req, res) => {
       if (!publicUrl && salesNavUrl && liAt) {
         publicUrl = await resolveSalesNavToPublicUrl(salesNavUrl, liAt);
       }
-
       let inferredPublic = null;
       if (!publicUrl && salesNavUrl && salesNavUrl.includes("/sales/lead/")) {
         inferredPublic = derivePublicFromSalesNav(salesNavUrl);
@@ -550,24 +501,12 @@ app.post("/upload-leads", async (req, res) => {
 
       const public_profile_url_to_store = publicUrl || inferredPublic || null;
 
-      if (!public_profile_url_to_store && !profileUrlLegacy && !salesNavUrl) {
-        skipped++;
-        return;
-      }
+      if (!public_profile_url_to_store && !profileUrlLegacy && !salesNavUrl) { skipped++; return; }
 
       const info = insertStmt.run(
-        userEmail,
-        firstName,
-        lastName,
-        profileUrlLegacy,
-        public_profile_url_to_store,
-        salesNavUrl,
-        organization,
-        title,
-        timestamp || new Date().toISOString(),
-        "scraped"
+        userEmail, firstName, lastName, profileUrlLegacy, public_profile_url_to_store, salesNavUrl,
+        organization, title, timestamp || new Date().toISOString(), "scraped"
       );
-
       if (info.changes > 0) inserted++; else skipped++;
     } catch {
       skipped++;
@@ -597,9 +536,7 @@ app.post("/upload-leads", async (req, res) => {
 // --- Leads / Excel / Automation ---
 app.get("/api/leads", authenticateToken, (req, res) => {
   try {
-    const rows = db
-      .prepare("SELECT * FROM leads WHERE user_email = ? ORDER BY scraped_at DESC")
-      .all(req.user.email);
+    const rows = db.prepare("SELECT * FROM leads WHERE user_email = ? ORDER BY scraped_at DESC").all(req.user.email);
     return res.json({ success: true, leads: rows });
   } catch (e) {
     console.error("api/leads error:", e);
@@ -609,10 +546,7 @@ app.get("/api/leads", authenticateToken, (req, res) => {
 
 app.get("/download-leads-excel", authenticateToken, async (req, res) => {
   try {
-    const rows = db
-      .prepare("SELECT * FROM leads WHERE user_email = ? ORDER BY scraped_at DESC")
-      .all(req.user.email);
-
+    const rows = db.prepare("SELECT * FROM leads WHERE user_email = ? ORDER BY scraped_at DESC").all(req.user.email);
     if (rows.length === 0) return res.status(404).send(`No leads found for ${req.user.email}.`);
 
     const wb = new ExcelJS.Workbook();
@@ -640,11 +574,7 @@ app.get("/download-leads-excel", authenticateToken, async (req, res) => {
     rows.forEach(r => ws.addRow(r));
 
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename=linqbridge_leads_${req.user.email.split("@")[0]}_${Date.now()}.xlsx`
-    );
-
+    res.setHeader("Content-Disposition", `attachment; filename=linqbridge_leads_${req.user.email.split("@")[0]}_${Date.now()}.xlsx`);
     await wb.xlsx.write(res);
     res.end();
   } catch (e) {
@@ -717,24 +647,16 @@ app.get("/api/automation/runner/tick", authenticateToken, (req, res) => {
 app.post("/api/automation/update-status", authenticateToken, (req, res) => {
   const { lead_id, status, action_details = {} } = req.body || {};
   const email = req.user.email;
-  if (!lead_id || !status) {
-    return res.status(400).json({ success: false, message: "Missing lead_id or status." });
-  }
+  if (!lead_id || !status) return res.status(400).json({ success: false, message: "Missing lead_id or status." });
 
-  let setClauses = [
-    `automation_status = ?`,
-    `last_action_timestamp = CURRENT_TIMESTAMP`,
-  ];
+  let setClauses = [`automation_status = ?`, `last_action_timestamp = CURRENT_TIMESTAMP`];
   const params = [status];
 
   let nextActionDate = null;
   switch (status) {
     case "connection_sent":
       nextActionDate = new Date(Date.now() + (Math.random() * (5 - 3) + 3) * 86400000).toISOString();
-      if (action_details.connection_note_sent) {
-        setClauses.push(`connection_note = ?`);
-        params.push(action_details.connection_note_sent);
-      }
+      if (action_details.connection_note_sent) { setClauses.push(`connection_note = ?`); params.push(action_details.connection_note_sent); }
       break;
     case "accepted":
       nextActionDate = new Date(Date.now() + (Math.random() * (2 - 1) + 1) * 3600000).toISOString();
@@ -753,23 +675,12 @@ app.post("/api/automation/update-status", authenticateToken, (req, res) => {
       break;
   }
 
-  if (nextActionDate) {
-    setClauses.push(`next_action_due_date = ?`);
-    params.push(nextActionDate);
-  } else {
-    setClauses.push(`next_action_due_date = NULL`);
-  }
+  if (nextActionDate) { setClauses.push(`next_action_due_date = ?`); params.push(nextActionDate); }
+  else { setClauses.push(`next_action_due_date = NULL`); }
 
-  if (action_details.liked_post_url) {
-    setClauses.push(`liked_post_url = ?`);
-    params.push(action_details.liked_post_url);
-  }
+  if (action_details.liked_post_url) { setClauses.push(`liked_post_url = ?`); params.push(action_details.liked_post_url); }
 
-  const sql = `
-    UPDATE leads
-    SET ${setClauses.join(", ")}
-    WHERE id = ? AND user_email = ?;
-  `;
+  const sql = `UPDATE leads SET ${setClauses.join(", ")} WHERE id = ? AND user_email = ?;`;
   params.push(lead_id, email);
 
   try {
@@ -782,26 +693,59 @@ app.post("/api/automation/update-status", authenticateToken, (req, res) => {
   }
 });
 
-// --- Connection status & logs (FIXED CSRF for Voyager) ---
+// --- Connection status & logs ---
+// Default = SOFT (no LinkedIn call). Live check only via ?live=1 with 10-min cooldown.
+const LIVE_CHECK_COOLDOWN_MS = 10 * 60 * 1000;
+
 app.get("/api/connection/check", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
-    const row = getLatestCookieRow(email);
+    const wantLive = req.query.live === "1";
+
+    const row = db.prepare(
+      "SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1"
+    ).get(email);
 
     if (!row?.li_at) {
       logConn(email, "warn", "status_fail", { reason: "no_li_at" });
-      return res.json({ connected: false, reason: "No li_at cookie on server. Capture cookies from the extension." });
+      return res.json({
+        connected: false,
+        mode: "none",
+        reason: "No li_at cookie on server. Capture cookies from the extension."
+      });
     }
 
-    // Build CSRF header from unquoted JSESSIONID (if present)
-    const jsid = (row.jsessionid || "").replace(/^"+|"+$/g, "");
-    const csrfHeader = jsid ? `ajax:${jsid}` : "ajax:123456789";
+    if (!wantLive) {
+      logConn(email, "info", "status_soft_ok", {
+        has_li_at: true,
+        has_jsessionid: !!row.jsessionid,
+        has_bcookie: !!row.bcookie
+      });
+      return res.json({
+        connected: "stored",
+        mode: "soft",
+        hint: "Click Verify in the dashboard to run a live check."
+      });
+    }
 
-    // Compose Cookie header (JSESSIONID must be quoted IN THE COOKIE)
-    const cookieParts = [`li_at=${row.li_at}`];
-    if (jsid) cookieParts.push(`JSESSIONID="${jsid}"`);
-    if (row.bcookie) cookieParts.push(`bcookie=${row.bcookie}`);
-    cookieParts.push("liap=true");
+    const last = db.prepare(`
+      SELECT created_at FROM connection_logs
+      WHERE user_email = ? AND event = 'status_live_ok'
+      ORDER BY id DESC LIMIT 1
+    `).get(email);
+    const lastTime = last ? new Date(last.created_at).getTime() : 0;
+    if (Date.now() - lastTime < LIVE_CHECK_COOLDOWN_MS) {
+      const msLeft = LIVE_CHECK_COOLDOWN_MS - (Date.now() - lastTime);
+      return res.json({ connected: "stored", mode: "cooldown", cooldownMs: msLeft });
+    }
+
+    const js = (row.jsessionid || "").replace(/^"|"$/g, "");
+    const csrf = js || "ajax:123456789";
+    const cookieHeader = [
+      `li_at=${row.li_at}`,
+      js ? `JSESSIONID="${js}"` : null,
+      row.bcookie ? `bcookie=${row.bcookie}` : null
+    ].filter(Boolean).join("; ");
 
     const url = "https://www.linkedin.com/voyager/api/me";
     try {
@@ -809,37 +753,36 @@ app.get("/api/connection/check", authenticateToken, async (req, res) => {
         method: "GET",
         headers: {
           "accept": "application/json",
-          "x-restli-protocol-version": "2.0.0",
-          "csrf-token": csrfHeader,
-          "cookie": cookieParts.join("; ") + ";",
-          "origin": "https://www.linkedin.com",
-          "referer": "https://www.linkedin.com/feed/",
-          "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+          "csrf-token": csrf,
+          "cookie": cookieHeader,
+          "accept-language": "en-US,en;q=0.9",
+          "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         },
-        signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
+        signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined
       });
 
       if (!resp.ok) {
         const body = await safeText(resp);
-        logConn(email, "warn", "status_fail", { http: resp.status, body: (body || "").slice(0, 300) });
-        return res.json({ connected: false, reason: `HTTP ${resp.status}` });
+        logConn(email, "warn", "status_fail", { http: resp.status, body: body?.slice(0, 200) });
+        return res.json({ connected: false, mode: "live", reason: `HTTP ${resp.status}` });
       }
 
       const data = await (async () => { try { return await resp.json(); } catch { return {}; } })();
       const name =
-        (data?.miniProfile?.firstName && data?.miniProfile?.lastName)
+        data?.miniProfile?.firstName && data?.miniProfile?.lastName
           ? `${data.miniProfile.firstName} ${data.miniProfile.lastName}`
           : (data?.firstName && data?.lastName ? `${data.firstName} ${data.lastName}` : null);
 
-      logConn(email, "info", "status_ok", { name });
-      return res.json({ connected: true, name: name || null });
+      logConn(email, "info", "status_live_ok", { name: name || null });
+      return res.json({ connected: true, mode: "live", name: name || null });
+
     } catch (e) {
       logConn(email, "error", "status_fail", { error: e.message });
-      return res.json({ connected: false, reason: "network_error" });
+      return res.json({ connected: false, mode: "live", reason: "network_error" });
     }
   } catch (e) {
     console.error("/api/connection/check error:", e);
-    return res.status(500).json({ connected: false, reason: "server_error" });
+    return res.status(500).json({ connected: false, mode: "server", reason: "server_error" });
   }
 });
 
@@ -854,7 +797,6 @@ app.get("/api/connection/logs", authenticateToken, (req, res) => {
       ORDER BY id DESC
       LIMIT ?;
     `).all(email, limit);
-
     const logs = rows.map(r => ({
       level: r.level,
       event: r.event,
@@ -877,7 +819,7 @@ app.get("/", (req, res) => {
   });
 });
 
-// --- Start Server ---
+// --- Start ---
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server is running on port ${PORT}`);
 });
