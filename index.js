@@ -1,4 +1,4 @@
-// index.js — LinqBridge backend (FINAL, with connection logs + robust CORS)
+// index.js — LinqBridge backend (FINAL, logs + robust CORS + fixed CSRF)
 
 // --- Core Modules ---
 const express = require("express");
@@ -52,8 +52,7 @@ const ALLOWED_ORIGINS = new Set([
 ]);
 app.use(cors({
   origin: (origin, cb) => {
-    // allow no-origin (e.g., curl/postman) and allowed list
-    if (!origin || ALLOWED_ORIGINS.has(origin)) return cb(null, true);
+    if (!origin || ALLOWED_ORIGINS.has(origin)) return cb(null, true); // allow Postman/curl (no origin)
     return cb(new Error(`Origin ${origin} not allowed by CORS`));
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -121,7 +120,7 @@ function initializeDatabase() {
     );
   `);
 
-  // NEW: connection logs
+  // Connection logs
   db.exec(`
     CREATE TABLE IF NOT EXISTS connection_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,6 +168,17 @@ function getLatestLiAtForUser(email) {
     return row?.li_at || null;
   } catch (e) {
     console.error("getLatestLiAtForUser error:", e);
+    return null;
+  }
+}
+
+function getLatestCookieRow(email) {
+  try {
+    return db
+      .prepare("SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1")
+      .get(email) || null;
+  } catch (e) {
+    console.error("getLatestCookieRow error:", e);
     return null;
   }
 }
@@ -403,8 +413,7 @@ app.get("/jobs/stats", async (_req, res) => {
 app.post("/store-cookies", (req, res) => {
   try {
     const body = req.body || {};
-    // accept either userEmail or email
-    const email = body.userEmail || body.email;
+    const email = body.userEmail || body.email; // accept either
     const cookies = body.cookies || {};
     const timestamp = body.timestamp || new Date().toISOString();
 
@@ -412,14 +421,18 @@ app.post("/store-cookies", (req, res) => {
       return res.status(400).json({ success: false, message: "Missing email or li_at cookie." });
     }
 
+    // sanitize JSESSIONID (store unquoted)
+    let jsid = cookies.JSESSIONID || null;
+    if (jsid && /^".*"$/.test(jsid)) jsid = jsid.slice(1, -1);
+
     db.prepare(`
       INSERT INTO cookies (email, li_at, jsessionid, bcookie, timestamp)
       VALUES (?, ?, ?, ?, ?)
-    `).run(email, cookies.li_at, cookies.JSESSIONID || null, cookies.bcookie || null, timestamp);
+    `).run(email, cookies.li_at, jsid, cookies.bcookie || null, timestamp);
 
     logConn(email, "info", "cookies_saved", {
       has_li_at: !!cookies.li_at,
-      has_jsessionid: !!cookies.JSESSIONID,
+      has_jsessionid: !!jsid,
       has_bcookie: !!cookies.bcookie,
     });
 
@@ -451,9 +464,7 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
     const { profileUrl, note = null, priority = 3 } = req.body || {};
     if (!profileUrl) return res.status(400).json({ error: "profileUrl required" });
 
-    const row = db.prepare(
-      "SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1"
-    ).get(email);
+    const row = getLatestCookieRow(email);
     if (!row?.li_at) return res.status(404).json({ error: "No li_at stored. Capture cookies first." });
 
     const d = await readJobs();
@@ -485,7 +496,7 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
 app.post("/upload-leads", async (req, res) => {
   console.log("Received /upload-leads");
   const { leads, timestamp } = req.body || {};
-  const userEmail = req.body.userEmail || req.body.email; // ← robust
+  const userEmail = req.body.userEmail || req.body.email; // robust
 
   if (!userEmail || !Array.isArray(leads) || leads.length === 0) {
     return res.status(400).json({ success: false, message: "Missing userEmail or leads." });
@@ -524,15 +535,14 @@ app.post("/upload-leads", async (req, res) => {
       let salesNavUrl =
         (rawLead.sales_nav_url && rawLead.sales_nav_url !== "N/A")
           ? rawLead.sales_nav_url
-          : (rawLead.profile_url || null); // sometimes profile_url holds SN URL
+          : (rawLead.profile_url || null);
 
       const profileUrlLegacy = rawLead.profile_url || null;
 
-      // Try resolve via Sales API if we have li_at
       if (!publicUrl && salesNavUrl && liAt) {
         publicUrl = await resolveSalesNavToPublicUrl(salesNavUrl, liAt);
       }
-      // Heuristic fallback
+
       let inferredPublic = null;
       if (!publicUrl && salesNavUrl && salesNavUrl.includes("/sales/lead/")) {
         inferredPublic = derivePublicFromSalesNav(salesNavUrl);
@@ -568,8 +578,7 @@ app.post("/upload-leads", async (req, res) => {
     workers.push((async function runWorker() {
       while (queue.length) {
         const next = queue.shift();
-        const idx = leads.length - queue.length;
-        await processOne(next, idx - 1);
+        await processOne(next);
       }
     })());
   }
@@ -773,44 +782,56 @@ app.post("/api/automation/update-status", authenticateToken, (req, res) => {
   }
 });
 
-// --- Connection status & logs ---
+// --- Connection status & logs (FIXED CSRF for Voyager) ---
 app.get("/api/connection/check", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
-    const row = db.prepare(
-      "SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1"
-    ).get(email);
+    const row = getLatestCookieRow(email);
 
     if (!row?.li_at) {
       logConn(email, "warn", "status_fail", { reason: "no_li_at" });
       return res.json({ connected: false, reason: "No li_at cookie on server. Capture cookies from the extension." });
     }
 
-    // Basic identity ping (expect 200 if li_at is valid)
+    // Build CSRF header from unquoted JSESSIONID (if present)
+    const jsid = (row.jsessionid || "").replace(/^"+|"+$/g, "");
+    const csrfHeader = jsid ? `ajax:${jsid}` : "ajax:123456789";
+
+    // Compose Cookie header (JSESSIONID must be quoted IN THE COOKIE)
+    const cookieParts = [`li_at=${row.li_at}`];
+    if (jsid) cookieParts.push(`JSESSIONID="${jsid}"`);
+    if (row.bcookie) cookieParts.push(`bcookie=${row.bcookie}`);
+    cookieParts.push("liap=true");
+
     const url = "https://www.linkedin.com/voyager/api/me";
     try {
       const resp = await fetch(url, {
+        method: "GET",
         headers: {
           "accept": "application/json",
-          "csrf-token": "ajax:123456789",
-          "cookie": `li_at=${row.li_at}; ${row.jsessionid ? `JSESSIONID="${row.jsessionid}";` : ""} ${row.bcookie ? `bcookie=${row.bcookie};` : ""}`,
+          "x-restli-protocol-version": "2.0.0",
+          "csrf-token": csrfHeader,
+          "cookie": cookieParts.join("; ") + ";",
+          "origin": "https://www.linkedin.com",
+          "referer": "https://www.linkedin.com/feed/",
+          "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
         },
         signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
       });
 
       if (!resp.ok) {
         const body = await safeText(resp);
-        logConn(email, "warn", "status_fail", { http: resp.status, body: body?.slice(0, 200) });
+        logConn(email, "warn", "status_fail", { http: resp.status, body: (body || "").slice(0, 300) });
         return res.json({ connected: false, reason: `HTTP ${resp.status}` });
       }
 
       const data = await (async () => { try { return await resp.json(); } catch { return {}; } })();
       const name =
-        data?.miniProfile?.firstName && data?.miniProfile?.lastName
+        (data?.miniProfile?.firstName && data?.miniProfile?.lastName)
           ? `${data.miniProfile.firstName} ${data.miniProfile.lastName}`
           : (data?.firstName && data?.lastName ? `${data.firstName} ${data.lastName}` : null);
 
-      logConn(email, "info", "status_ok", { name: name || null });
+      logConn(email, "info", "status_ok", { name });
       return res.json({ connected: true, name: name || null });
     } catch (e) {
       logConn(email, "error", "status_fail", { error: e.message });
