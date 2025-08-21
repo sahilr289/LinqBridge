@@ -18,15 +18,15 @@
       </div>
 
       <div id="login-form" class="form form-active">
-        <input type="email" id="login-email" placeholder="Email"/>
-        <input type="password" id="login-password" placeholder="Password"/>
+        <input type="email" id="login-email" placeholder="Email" />
+        <input type="password" id="login-password" placeholder="Password" />
         <button id="login-btn" class="btn primary">Log In</button>
       </div>
 
       <div id="register-form" class="form">
-        <input type="email" id="reg-email" placeholder="Email"/>
-        <input type="password" id="reg-password" placeholder="Password"/>
-        <input type="password" id="reg-password2" placeholder="Confirm Password"/>
+        <input type="email" id="reg-email" placeholder="Email" />
+        <input type="password" id="reg-password" placeholder="Password" />
+        <input type="password" id="reg-password2" placeholder="Confirm Password" />
         <button id="register-btn" class="btn">Create Account</button>
       </div>
 
@@ -59,15 +59,15 @@
 
         <table id="leads-table">
           <thead>
-          <tr>
-            <th>First</th>
-            <th>Last</th>
-            <th>Organization</th>
-            <th>Title</th>
-            <th>Public URL</th>
-            <th>Sales Nav URL</th>
-            <th>Status</th>
-          </tr>
+            <tr>
+              <th>First</th>
+              <th>Last</th>
+              <th>Organization</th>
+              <th>Title</th>
+              <th>Public URL</th>
+              <th>Sales Nav URL</th>
+              <th>Status</th>
+            </tr>
           </thead>
           <tbody></tbody>
         </table>
@@ -76,20 +76,39 @@
       <!-- Connect LinkedIn view -->
       <div id="view-connection" class="app-view" style="display:none;">
         <div class="section">
-          <h3>Connect your profile</h3>
-          <p>
-            Make sure you’ve clicked <em>Capture Cookies</em> in the Chrome extension so the server has your
-            <code>li_at</code>, <code>JSESSIONID</code>, and <code>bcookie</code>. Then press **Check Connection**.
+          <h3>Connect your LinkedIn</h3>
+          <p class="help">
+            You’ll log in directly on LinkedIn in a secure browser. We never see your password or 2FA codes.
           </p>
-          <button id="check-conn-btn" class="btn primary">Check Connection</button>
-          <span id="conn-status" class="badge" style="margin-left:10px;"></span>
-          <div id="conn-msg" class="msg" style="display:none; margin-top:10px;"></div>
+
+          <div class="row" style="margin:10px 0;">
+            <button id="connect-start-btn" class="btn primary">Login via secure browser</button>
+            <button id="connect-test-btn" class="btn">Test connection</button>
+            <a id="open-viewer-link" class="btn secondary" href="#" target="_blank" rel="noreferrer">Open viewer</a>
+
+            <span id="conn-spinner" class="spinner" style="display:none;"></span>
+            <span class="status">
+              <span id="conn-dot" class="dot"></span>
+              <span id="conn-status-text">Not linked</span>
+            </span>
+            <span id="conn-status" class="badge" style="display:none; margin-left:6px;"></span>
+          </div>
+
+          <div id="conn-msg" class="msg info" style="display:none;"></div>
+
+          <hr class="hr"/>
+
+          <p class="help">
+            Optional: if your Chrome extension already captured cookies (li_at, JSESSIONID, bcookie), we’ll also use them to help resolve Sales Navigator URLs. You can still use the secure browser login flow above for safer, persistent sessions.
+          </p>
         </div>
 
         <div class="section">
           <h3>Recent connection logs</h3>
-          <button id="reload-logs-btn" class="btn">Reload Logs</button>
-          <table id="logs-table" style="margin-top:10px; width:100%;">
+          <div class="row" style="margin-bottom:8px;">
+            <button id="reload-logs-btn" class="btn">Reload Logs</button>
+          </div>
+          <table id="logs-table" style="width:100%;">
             <thead>
               <tr>
                 <th>Time</th>

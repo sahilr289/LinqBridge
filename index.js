@@ -1,4 +1,4 @@
-// index.js — LinqBridge backend (FINAL, soft/live connection check + logs, robust CORS)
+// index.js — LinqBridge backend (FINAL, adds Connect flow endpoints + job lookup)
 
 const express = require("express");
 const cors = require("cors");
@@ -16,6 +16,10 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key_change_this_for_prod";
 
+// --- Optional viewer info for Connect flow ---
+const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || "";     // e.g. https://linqbridge-worker-xxxx.up.railway.app
+const NOVNC_PASSWORD  = process.env.NOVNC_PASSWORD  || "changeme123";
+
 // --- File-backed Job Queue ---
 const DATA_DIR = path.join(__dirname, "data");
 const JOBS_FILE = path.join(DATA_DIR, "jobs.json");
@@ -28,6 +32,17 @@ const JOBS_FILE = path.join(DATA_DIR, "jobs.json");
 })();
 async function readJobs() { return fs.readJson(JOBS_FILE); }
 async function writeJobs(d) { return fs.writeJson(JOBS_FILE, d, { spaces: 2 }); }
+
+// Helper: find job by id across all queues
+async function findJobById(id) {
+  const d = await readJobs();
+  const pools = ["queued", "active", "done", "failed"];
+  for (const p of pools) {
+    const i = d[p].findIndex(j => j.id === id);
+    if (i !== -1) return { pool: p, index: i, job: d[p][i] };
+  }
+  return null;
+}
 
 // --- Worker-only Auth ---
 function requireWorkerAuth(req, res, next) {
@@ -287,6 +302,17 @@ app.post("/jobs", async (req, res) => {
   }
 });
 
+app.get("/jobs/:id", async (req, res) => {
+  try {
+    const found = await findJobById(req.params.id);
+    if (!found) return res.status(404).json({ error: "Job not found" });
+    res.json({ ok: true, job: found.job, pool: found.pool });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to get job." });
+  }
+});
+
 app.post("/jobs/next", requireWorkerAuth, async (req, res) => {
   try {
     const { types } = req.body || {};
@@ -427,6 +453,9 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
       id: uuidv4(),
       type: "SEND_CONNECTION",
       payload: {
+        // map email to worker's per-user session keys if needed
+        tenantId: "default",
+        userId: email,
         profileUrl,
         note,
         cookieBundle: { li_at: row.li_at, jsessionid: row.jsessionid || null, bcookie: row.bcookie || null },
@@ -807,6 +836,73 @@ app.get("/api/connection/logs", authenticateToken, (req, res) => {
   } catch (e) {
     console.error("/api/connection/logs error:", e);
     res.status(500).json({ success: false, logs: [] });
+  }
+});
+
+// --- Connect flow endpoints (UI -> backend) ---
+app.post("/api/connect/start", authenticateToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+    // Enqueue AUTH_CHECK for this user. Worker will save storageState per userId=email.
+    const d = await readJobs();
+    const job = {
+      id: uuidv4(),
+      type: "AUTH_CHECK",
+      payload: { tenantId: "default", userId: email },
+      priority: 1,
+      status: "queued",
+      enqueuedAt: new Date().toISOString(),
+      attempts: 0,
+      lastError: null,
+    };
+    d.queued.push(job);
+    d.queued.sort((a, b) => a.priority - b.priority);
+    await writeJobs(d);
+
+    // Compose viewer URL if configured
+    const viewerUrl = VIEWER_BASE_URL
+      ? `${VIEWER_BASE_URL.replace(/\/+$/,"")}/vnc_lite.html?autoconnect=1&view_only=0&password=${encodeURIComponent(NOVNC_PASSWORD)}`
+      : null;
+
+    return res.json({ ok: true, jobId: job.id, viewerUrl });
+  } catch (e) {
+    console.error("/api/connect/start error:", e);
+    return res.status(500).json({ ok: false, error: "Failed to start connect" });
+  }
+});
+
+app.get("/api/connect/status/:jobId", authenticateToken, async (req, res) => {
+  try {
+    const item = await findJobById(req.params.jobId);
+    if (!item) return res.status(404).json({ ok: false, error: "Job not found" });
+    return res.json({ ok: true, job: item.job, pool: item.pool });
+  } catch (e) {
+    console.error("/api/connect/status error:", e);
+    return res.status(500).json({ ok: false, error: "Failed to fetch status" });
+  }
+});
+
+app.post("/api/connect/test", authenticateToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+    const d = await readJobs();
+    const job = {
+      id: uuidv4(),
+      type: "AUTH_CHECK",
+      payload: { tenantId: "default", userId: email }, // same as start; worker will just verify & re-save if needed
+      priority: 2,
+      status: "queued",
+      enqueuedAt: new Date().toISOString(),
+      attempts: 0,
+      lastError: null,
+    };
+    d.queued.push(job);
+    d.queued.sort((a, b) => a.priority - b.priority);
+    await writeJobs(d);
+    return res.json({ ok: true, jobId: job.id });
+  } catch (e) {
+    console.error("/api/connect/test error:", e);
+    return res.status(500).json({ ok: false, error: "Failed to enqueue test" });
   }
 });
 

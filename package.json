@@ -4,11 +4,14 @@
   "private": true,
   "description": "LinqBridge backend",
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "start:dev": "NODE_ENV=development node index.js",
+    "lint:deps": "npm ls || true"
   },
   "engines": {
-    "node": ">=18.17 <=22.x"
+    "node": ">=18.17 <23"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",

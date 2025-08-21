@@ -1,20 +1,27 @@
-// dashboard.js — LinqBridge Dashboard (Leads + Connect LinkedIn)
+// dashboard.js — LinqBridge Dashboard (Leads + Connect LinkedIn with viewer + job polling)
 
-const API_BASE = ""; // same-origin (Railway domain serves this file)
+const API_BASE = ""; // same-origin (served by your backend)
 const LS_TOKEN = "lb_token";
 const LS_EMAIL = "lb_email";
 
 // ---------- tiny helpers ----------
 function $(id) { return document.getElementById(id); }
-function show(el) { el && (el.style.display = "block"); }
-function hide(el) { el && (el.style.display = "none"); }
-function setText(el, txt) { el && (el.textContent = txt); }
+function show(el) { if (el) el.style.display = "block"; }
+function hide(el) { if (el) el.style.display = "none"; }
+function setText(el, txt) { if (el) el.textContent = txt; }
+function setAttr(el, k, v) { if (el) el.setAttribute(k, v); }
+function hasEl(id) { return !!$(id); }
 
-function setMsg(el, text, type="info") {
+function setMsg(el, text, type = "info") {
   if (!el) return;
   el.className = "msg " + type;
   el.textContent = text;
   show(el);
+}
+function clearMsg(el) {
+  if (!el) return;
+  el.textContent = "";
+  hide(el);
 }
 
 async function api(path, { method = "GET", headers = {}, body } = {}) {
@@ -32,11 +39,10 @@ async function api(path, { method = "GET", headers = {}, body } = {}) {
   const ct = res.headers.get("content-type") || "";
   const text = await res.text();
   if (!ct.includes("application/json")) {
-    // allow file downloads to pass through this helper as non-json
     return { _raw: text, _status: res.status };
   }
   const json = JSON.parse(text);
-  if (!res.ok) throw new Error(json.message || `HTTP ${res.status}`);
+  if (!res.ok) throw new Error(json.error || json.message || `HTTP ${res.status}`);
   return json;
 }
 
@@ -45,11 +51,11 @@ function switchAuthTab(tab) {
   const loginTab = $("tab-login"), regTab = $("tab-register");
   const loginForm = $("login-form"), regForm = $("register-form");
   if (tab === "login") {
-    loginTab.classList.add("active"); regTab.classList.remove("active");
-    loginForm.classList.add("form-active"); regForm.classList.remove("form-active");
+    loginTab?.classList.add("active"); regTab?.classList.remove("active");
+    loginForm?.classList.add("form-active"); regForm?.classList.remove("form-active");
   } else {
-    regTab.classList.add("active"); loginTab.classList.remove("active");
-    regForm.classList.add("form-active"); loginForm.classList.remove("form-active");
+    regTab?.classList.add("active"); loginTab?.classList.remove("active");
+    regForm?.classList.add("form-active"); loginForm?.classList.remove("form-active");
   }
 }
 
@@ -97,7 +103,7 @@ async function doRegister() {
 function logout() {
   localStorage.removeItem(LS_TOKEN);
   localStorage.removeItem(LS_EMAIL);
-  $("whoami").textContent = "";
+  setText($("whoami"), "");
   hide($("app"));
   show($("auth-card"));
 }
@@ -110,13 +116,13 @@ function switchAppView(view) {
   const conn     = $("view-connection");
 
   if (view === "leads") {
-    leadsBtn.classList.add("active"); connBtn.classList.remove("active");
-    leads.classList.add("view-active"); leads.style.display = "block";
-    conn.classList.remove("view-active"); conn.style.display = "none";
+    leadsBtn?.classList.add("active"); connBtn?.classList.remove("active");
+    leads?.classList.add("view-active"); if (leads) leads.style.display = "block";
+    conn?.classList.remove("view-active"); if (conn) conn.style.display = "none";
   } else {
-    connBtn.classList.add("active"); leadsBtn.classList.remove("active");
-    conn.classList.add("view-active"); conn.style.display = "block";
-    leads.classList.remove("view-active"); leads.style.display = "none";
+    connBtn?.classList.add("active"); leadsBtn?.classList.remove("active");
+    conn?.classList.add("view-active"); if (conn) conn.style.display = "block";
+    leads?.classList.remove("view-active"); if (leads) leads.style.display = "none";
   }
 }
 
@@ -180,28 +186,167 @@ async function downloadExcel() {
   URL.revokeObjectURL(url);
 }
 
-// ---------- connection ----------
-async function checkConnection() {
-  const status = $("conn-status");
-  const msg = $("conn-msg");
-  setText(status, "Checking…");
-  status.className = "badge";
-  hide(msg);
-  try {
-    const data = await api("/api/connection/check");
-    if (data.connected) {
-      status.className = "badge ok";
-      setText(status, data.name ? `Connected as ${data.name}` : "Connected");
-      setMsg(msg, "Your cookies are valid. Worker can send connection requests.", "success");
+// ---------- connection (new: secure browser + job polling) ----------
+let connectJobId = null;
+let connectPollTimer = null;
+let lastViewerUrl = null;
+
+function setConnVisual({ state = "idle", text = "Not linked", badge = null, dot = null, spinning = false, msg = null, msgType = "info" } = {}) {
+  // Dot + text
+  const dotEl = $("conn-dot");
+  const txtEl = $("conn-status-text");
+  if (dotEl) {
+    dotEl.className = "dot" + (dot ? " " + dot : "");
+  }
+  if (txtEl) setText(txtEl, text);
+
+  // Badge (optional)
+  const badgeEl = $("conn-status");
+  if (badgeEl) {
+    if (badge) {
+      badgeEl.className = "badge " + badge;
+      show(badgeEl);
     } else {
-      status.className = "badge fail";
-      setText(status, "Not connected");
-      setMsg(msg, data.reason || "Not connected.", "error");
+      hide(badgeEl);
+    }
+  }
+
+  // Spinner
+  const spinner = $("conn-spinner");
+  if (spinner) spinning ? show(spinner) : hide(spinner);
+
+  // Message
+  const msgEl = $("conn-msg");
+  if (msgEl) {
+    if (msg) setMsg(msgEl, msg, msgType);
+    else clearMsg(msgEl);
+  }
+}
+
+async function startConnectFlow() {
+  // Kick off AUTH_CHECK and open viewer
+  try {
+    setConnVisual({ state: "linking", text: "Linking… complete login + 2FA", dot: "info", spinning: true, msg: "A secure browser will open. Sign in to LinkedIn and finish 2FA, then leave this tab open while we verify." });
+    const res = await api("/api/connect/start", { method: "POST" });
+    connectJobId = res.jobId || null;
+    lastViewerUrl = res.viewerUrl || null;
+
+    // Set viewer link & open it
+    if (hasEl("open-viewer-link") && lastViewerUrl) {
+      setAttr($("open-viewer-link"), "href", lastViewerUrl);
+      // auto-open in a new tab to make it fast
+      window.open(lastViewerUrl, "_blank", "noopener");
+    }
+
+    // begin polling
+    beginConnectPolling();
+  } catch (e) {
+    setConnVisual({ state: "error", text: "Error", dot: "fail", spinning: false, msg: e.message || "Failed to start connect.", msgType: "error" });
+  }
+}
+
+async function testConnectFlow() {
+  // Re-enqueue AUTH_CHECK to verify session still valid
+  try {
+    setConnVisual({ state: "testing", text: "Verifying session…", dot: "info", spinning: true });
+    const res = await api("/api/connect/test", { method: "POST" });
+    connectJobId = res.jobId || null;
+    beginConnectPolling();
+  } catch (e) {
+    setConnVisual({ state: "error", text: "Error", dot: "fail", spinning: false, msg: e.message || "Failed to start test.", msgType: "error" });
+  }
+}
+
+function beginConnectPolling() {
+  if (!connectJobId) return;
+  if (connectPollTimer) clearInterval(connectPollTimer);
+  connectPollTimer = setInterval(pollConnectStatus, 2000);
+}
+
+async function pollConnectStatus() {
+  if (!connectJobId) return;
+  try {
+    const r = await api(`/api/connect/status/${connectJobId}`, { method: "GET" });
+    const job = r.job || {};
+    const pool = r.pool || job.pool || "";
+    const status = job.status || "";
+
+    // If worker completed successfully, expect pool 'done' and result.ok === true
+    const result = job.result || {};
+    const ok = result.ok === true;
+
+    if (pool === "done" || status === "done" || ok) {
+      // success
+      clearInterval(connectPollTimer); connectPollTimer = null; connectJobId = null;
+      setConnVisual({ state: "linked", text: "Linked ✓ (valid)", dot: "ok", spinning: false, badge: "ok", msg: "Authenticated. You can start automation now.", msgType: "success" });
+      return;
+    }
+    if (pool === "failed" || status === "failed") {
+      clearInterval(connectPollTimer); connectPollTimer = null; connectJobId = null;
+      const details = (result && (result.details || result.reason)) || job.lastError || "Action needed. Re-authenticate.";
+      setConnVisual({ state: "action_needed", text: "Action needed", dot: "warn", spinning: false, badge: "warn", msg: details.toString(), msgType: "warning" });
+      return;
+    }
+
+    // still running
+    setConnVisual({ state: "linking", text: "Linking… complete login + 2FA", dot: "info", spinning: true });
+
+  } catch (e) {
+    clearInterval(connectPollTimer); connectPollTimer = null; connectJobId = null;
+    setConnVisual({ state: "error", text: "Error", dot: "fail", spinning: false, msg: e.message || "Polling error.", msgType: "error" });
+  }
+}
+
+// Legacy/auxiliary soft check (kept for compatibility). Can update the new UI too.
+async function checkConnection() {
+  const msg = $("conn-msg");
+  try {
+    setConnVisual({ state: "checking", text: "Checking…", dot: "info", spinning: true });
+    const data = await api("/api/connection/check"); // soft by default
+    if (data.connected === true) {
+      setConnVisual({
+        state: "linked",
+        text: data.name ? `Connected as ${data.name}` : "Connected",
+        dot: "ok",
+        spinning: false,
+        badge: "ok",
+        msg: "Your cookies are valid. Worker can send connection requests.",
+        msgType: "success"
+      });
+    } else if (data.mode === "cooldown") {
+      const mins = Math.ceil((data.cooldownMs || 0) / 60000);
+      setConnVisual({
+        state: "cooldown",
+        text: "Stored session (cooldown)",
+        dot: "info",
+        spinning: false,
+        badge: "cooldown",
+        msg: `Live check cooldown in effect. Try again in ~${mins} min.`,
+        msgType: "info"
+      });
+    } else if (data.connected === "stored") {
+      setConnVisual({
+        state: "stored",
+        text: "Cookies stored",
+        dot: "info",
+        spinning: false,
+        badge: null,
+        msg: data.hint || "Stored cookies found. For a durable session, use Login via secure browser.",
+        msgType: "info"
+      });
+    } else {
+      setConnVisual({
+        state: "not_linked",
+        text: "Not connected",
+        dot: "fail",
+        spinning: false,
+        badge: "fail",
+        msg: data.reason || "Not connected.",
+        msgType: "error"
+      });
     }
   } catch (e) {
-    status.className = "badge fail";
-    setText(status, "Error");
-    setMsg(msg, e.message || "Failed to check status.", "error");
+    setConnVisual({ state: "error", text: "Error", dot: "fail", spinning: false, msg: e.message || "Failed to check status.", msgType: "error" });
   }
 }
 
@@ -237,30 +382,43 @@ function showApp() {
 // ---------- event wiring ----------
 document.addEventListener("DOMContentLoaded", () => {
   // auth tab buttons
-  $("tab-login").addEventListener("click", () => switchAuthTab("login"));
-  $("tab-register").addEventListener("click", () => switchAuthTab("register"));
+  $("tab-login")?.addEventListener("click", () => switchAuthTab("login"));
+  $("tab-register")?.addEventListener("click", () => switchAuthTab("register"));
 
   // auth actions
-  $("login-btn").addEventListener("click", doLogin);
-  $("register-btn").addEventListener("click", doRegister);
-  $("logout-btn").addEventListener("click", logout);
+  $("login-btn")?.addEventListener("click", doLogin);
+  $("register-btn")?.addEventListener("click", doRegister);
+  $("logout-btn")?.addEventListener("click", logout);
 
   // app tab buttons
-  $("app-tab-leads").addEventListener("click", () => switchAppView("leads"));
-  $("app-tab-connection").addEventListener("click", () => {
+  $("app-tab-leads")?.addEventListener("click", () => switchAppView("leads"));
+  $("app-tab-connection")?.addEventListener("click", () => {
     switchAppView("connection");
-    // auto-refresh status & logs when opening the tab
+    // On opening the tab, show current stored status + logs
     checkConnection();
     loadLogs();
   });
 
   // leads actions
-  $("reload-btn").addEventListener("click", loadLeads);
-  $("download-btn").addEventListener("click", downloadExcel);
+  $("reload-btn")?.addEventListener("click", loadLeads);
+  $("download-btn")?.addEventListener("click", downloadExcel);
 
-  // connection actions
-  $("check-conn-btn").addEventListener("click", checkConnection);
-  $("reload-logs-btn").addEventListener("click", loadLogs);
+  // connect flow buttons (new)
+  $("connect-start-btn")?.addEventListener("click", startConnectFlow);
+  $("connect-test-btn")?.addEventListener("click", testConnectFlow);
+
+  // Optional legacy button if it still exists in older HTML:
+  $("check-conn-btn")?.addEventListener("click", checkConnection);
+
+  // Ensure viewer link shows last known URL if page reloads (will be null first load)
+  if (hasEl("open-viewer-link") && lastViewerUrl) {
+    setAttr($("open-viewer-link"), "href", lastViewerUrl);
+  } else if (hasEl("open-viewer-link")) {
+    // prevent empty #
+    $("open-viewer-link").addEventListener("click", (e) => {
+      if (!lastViewerUrl) e.preventDefault();
+    });
+  }
 
   // autologin if token exists
   if (localStorage.getItem(LS_TOKEN)) {

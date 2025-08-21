@@ -1,117 +1,59 @@
-:root {
-  --brand: #0077b5;
-  --bg: #f5f7fa;
-  --card: #fff;
-  --text: #333;
-  --muted: #777;
-  --border: #e5e7eb;
-  --danger: #e11d48;
+/* --- Connect tab extras (append) --- */
 
-  /* extras */
-  --ok-bg: #d1fae5;
-  --ok-text: #065f46;
-  --fail-bg: #fee2e2;
-  --fail-text: #7f1d1d;
-  --info-bg: #e0e7ff;
-  --info-text: #1e3a8a;
-  --warn-bg: #fff7ed;
-  --warn-text: #9a3412;
+/* More badge states */
+.badge.cooldown { background: var(--info-bg);  color: var(--info-text);  border-color: #c7d2fe; }
+.badge.warn     { background: var(--warn-bg);  color: var(--warn-text);  border-color: #fed7aa; }
+.badge.paused   { background: #f1f5f9;         color: #475569;          border-color: var(--border); }
+
+/* Small status dot (use with text) */
+.status {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--muted);
+}
+.status .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #cbd5e1; /* default */
+}
+.status .dot.ok    { background: #10b981; }
+.status .dot.fail  { background: #ef4444; }
+.status .dot.warn  { background: #f59e0b; }
+.status .dot.info  { background: #3b82f6; }
+
+/* Button variants for Connect tab */
+.btn.secondary { background: #f8fafc; border-color: var(--border); color: #111827; }
+.btn.ghost     { background: transparent; border-color: transparent; color: var(--brand); }
+.btn.block     { display: block; width: 100%; }
+
+/* Loading spinner for “Linking…” */
+.spinner {
+  width: 16px; height: 16px; border: 2px solid #d1d5db; border-top-color: var(--brand);
+  border-radius: 50%; display: inline-block; animation: spin 0.9s linear infinite;
+  vertical-align: -3px; margin-right: 8px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Simple layout helpers */
+.row   { display: flex; gap: 10px; align-items: center; }
+.stack { display: grid; gap: 10px; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 720px) { .grid-2 { grid-template-columns: 1fr; } }
+
+/* Link styling for viewer URL / actions */
+.link { color: var(--brand); text-decoration: none; }
+.link:hover { text-decoration: underline; }
+
+/* Inline code (to show sample curl, etc.) */
+.code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; background: #f8fafc; border: 1px solid var(--border);
+  padding: 2px 6px; border-radius: 6px; color: #0f172a;
 }
 
-* { box-sizing: border-box; }
-body {
-  margin: 0; padding: 24px;
-  background: var(--bg); color: var(--text);
-  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-}
-.container { max-width: 1000px; margin: 0 auto; }
-h1 { color: var(--brand); margin: 0 0 16px; }
+/* Small helper text */
+.help { font-size: 12px; color: var(--muted); }
 
-.card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 16px;
-  margin-bottom: 16px;
-  box-shadow: 0 1px 2px rgba(0,0,0,.03);
-}
-
-/* Tabs (auth + app) */
-.tabs, .app-tabs { display: flex; gap: 8px; margin-bottom: 12px; }
-.tab {
-  border: 1px solid var(--border);
-  background: #fff;
-  padding: 8px 12px;
-  border-radius: 8px;
-  cursor: pointer;
-}
-.tab.active { background: var(--brand); color: #fff; border-color: var(--brand); }
-
-/* Forms */
-.form { display: none; gap: 8px; }
-.form-active { display: grid; }
-.form input {
-  padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px;
-}
-
-/* Buttons */
-.btn {
-  padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border); background: #fff;
-  cursor: pointer;
-}
-.btn.primary { background: var(--brand); color: #fff; border-color: var(--brand); }
-.btn.danger { background: var(--danger); color: #fff; border-color: var(--danger); }
-.btn:disabled { opacity: .6; cursor: not-allowed; }
-
-/* Toolbars */
-.toolbar {
-  display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px;
-}
-.toolbar .right { display: flex; align-items: center; gap: 12px; }
-#whoami { color: var(--muted); }
-
-/* Views inside app */
-.app-view { display: none; }
-.app-view.view-active { display: block; }
-
-/* Sections in connection tab */
-.section { margin: 10px 0 18px; }
-.section h3 { margin: 0 0 6px; }
-
-/* Badge for connection status */
-.badge {
-  display: inline-block;
-  padding: 4px 10px;
-  border-radius: 999px;
-  background: #eee;
-  color: #333;
-  font-size: 12px;
-  border: 1px solid var(--border);
-}
-.badge.ok   { background: var(--ok-bg);   color: var(--ok-text);   border-color: #a7f3d0; }
-.badge.fail { background: var(--fail-bg); color: var(--fail-text); border-color: #fecaca; }
-
-/* Messages */
-.msg {
-  margin-top: 8px; padding: 10px 12px; border-radius: 8px;
-  background: #eef6ff; color: #084c8c; border: 1px solid #b6daff;
-}
-.msg.error   { background: var(--fail-bg); color: var(--fail-text); border-color: #fecaca; }
-.msg.success { background: var(--ok-bg);   color: var(--ok-text);   border-color: #a7f3d0; }
-.msg.info    { background: var(--info-bg); color: var(--info-text); border-color: #c7d2fe; }
-.msg.warning { background: var(--warn-bg); color: var(--warn-text); border-color: #fed7aa; }
-
-/* Tables (reused for leads & logs) */
-table { width: 100%; border-collapse: collapse; }
-#leads-table th, #leads-table td,
-#logs-table th,  #logs-table td {
-  border: 1px solid var(--border); padding: 8px; text-align: left; vertical-align: top;
-}
-#leads-table th, #logs-table th { background: #f3f4f6; }
-
-/* Responsive tweaks */
-@media (max-width: 720px) {
-  .toolbar { flex-direction: column; align-items: stretch; gap: 8px; }
-  .tabs, .app-tabs { flex-wrap: wrap; }
-  table { font-size: 14px; }
+/* Section divider used in Connect tab */
+.hr {
+  height: 1px; background: var(--border); border: 0;
+  margin: 12px 0;
 }
