@@ -1,4 +1,4 @@
-// index.js — LinqBridge backend (FINAL, adds Connect flow endpoints + job lookup)
+// index.js — LinqBridge backend (FINAL: quieter logs, Connect flow endpoints + job lookup)
 
 const express = require("express");
 const cors = require("cors");
@@ -77,7 +77,8 @@ app.options("*", cors());
 
 // --- DB ---
 const dbPath = path.join(__dirname, "linqbridge.db");
-const db = new Database(dbPath, { verbose: console.log });
+const LOG_SQL = (/^(true|1|yes)$/i).test(process.env.LOG_SQL || "false");
+const db = new Database(dbPath, LOG_SQL ? { verbose: console.log } : {});
 
 function initializeDatabase() {
   db.exec(`
@@ -453,7 +454,6 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
       id: uuidv4(),
       type: "SEND_CONNECTION",
       payload: {
-        // map email to worker's per-user session keys if needed
         tenantId: "default",
         userId: email,
         profileUrl,
@@ -478,7 +478,7 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
 
 // --- Leads upload (accept userEmail OR email) ---
 app.post("/upload-leads", async (req, res) => {
-  console.log("Received /upload-leads");
+  if (process.env.LOG_UPLOADS === "true") console.log("Received /upload-leads");
   const { leads, timestamp } = req.body || {};
   const userEmail = req.body.userEmail || req.body.email;
   if (!userEmail || !Array.isArray(leads) || leads.length === 0) {
@@ -502,7 +502,7 @@ app.post("/upload-leads", async (req, res) => {
   const queue = [...leads];
   const workers = [];
 
-  async function processOne(rawLead, index) {
+  async function processOne(rawLead) {
     try {
       const firstName = rawLead.first_name || null;
       const lastName  = rawLead.last_name || null;
