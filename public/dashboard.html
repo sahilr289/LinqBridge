@@ -18,15 +18,15 @@
       </div>
 
       <div id="login-form" class="form form-active">
-        <input type="email" id="login-email" placeholder="Email" />
-        <input type="password" id="login-password" placeholder="Password" />
+        <input type="email" id="login-email" placeholder="Email" autocomplete="username" />
+        <input type="password" id="login-password" placeholder="Password" autocomplete="current-password" />
         <button id="login-btn" class="btn primary">Log In</button>
       </div>
 
       <div id="register-form" class="form">
-        <input type="email" id="reg-email" placeholder="Email" />
-        <input type="password" id="reg-password" placeholder="Password" />
-        <input type="password" id="reg-password2" placeholder="Confirm Password" />
+        <input type="email" id="reg-email" placeholder="Email" autocomplete="email" />
+        <input type="password" id="reg-password" placeholder="Password" autocomplete="new-password" />
+        <input type="password" id="reg-password2" placeholder="Confirm Password" autocomplete="new-password" />
         <button id="register-btn" class="btn">Create Account</button>
       </div>
 
@@ -84,7 +84,7 @@
           <div class="row" style="margin:10px 0;">
             <button id="connect-start-btn" class="btn primary">Login via secure browser</button>
             <button id="connect-test-btn" class="btn">Test connection</button>
-            <a id="open-viewer-link" class="btn secondary" href="#" target="_blank" rel="noreferrer">Open viewer</a>
+            <a id="open-viewer-link" class="btn secondary" href="#" target="_blank" rel="noopener noreferrer">Open viewer</a>
 
             <span id="conn-spinner" class="spinner" style="display:none;"></span>
             <span class="status">
@@ -124,6 +124,6 @@
     </div>
   </div>
 
-  <script src="dashboard.js"></script>
+  <script src="dashboard.js" defer></script>
 </body>
 </html>

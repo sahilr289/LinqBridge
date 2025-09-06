@@ -1,4 +1,6 @@
-// index.js — LinqBridge backend (FINAL)
+// index.js — LinqBridge backend (FINAL: creds vault + /api/connect + existing flows)
+
+"use strict";
 
 const express = require("express");
 const cors = require("cors");
@@ -9,12 +11,14 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const fs = require("fs-extra");
 const { v4: uuidv4 } = require("uuid");
+const crypto = require("crypto");
 require("dotenv").config();
 
 // --- Server ---
 const app = express();
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key_change_this_for_prod";
+const MASTER_KEY = process.env.MASTER_KEY || ""; // REQUIRED for secrets vault
 
 // --- Optional viewer info for Connect flow ---
 const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || "";     // e.g. https://linqbridge-worker-xxxx.up.railway.app
@@ -53,6 +57,34 @@ function requireWorkerAuth(req, res, next) {
   next();
 }
 
+// --- Encryption helpers (AES-256-GCM) ---
+function _getKey() {
+  if (!MASTER_KEY) throw new Error("MASTER_KEY env not set");
+  if (/^[A-Fa-f0-9]{64}$/.test(MASTER_KEY)) return Buffer.from(MASTER_KEY, "hex");         // 32 bytes hex
+  if (/^[A-Za-z0-9+/=]{43,44}$/.test(MASTER_KEY)) return Buffer.from(MASTER_KEY, "base64"); // 32 bytes b64
+  return crypto.createHash("sha256").update(MASTER_KEY).digest();                           // derive
+}
+function encryptJson(obj) {
+  const key = _getKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const pt = Buffer.from(JSON.stringify(obj), "utf8");
+  const ct = Buffer.concat([cipher.update(pt), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, ct]).toString("base64"); // iv(12) | tag(16) | ct
+}
+function decryptJson(b64) {
+  const key = _getKey();
+  const buf = Buffer.from(b64, "base64");
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(12, 28);
+  const ct = buf.subarray(28);
+  const dec = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  dec.setAuthTag(tag);
+  const pt = Buffer.concat([dec.update(ct), dec.final()]);
+  return JSON.parse(pt.toString("utf8"));
+}
+
 // --- Middleware ---
 app.use(express.json({ limit: "50mb" }));
 app.use(express.static("public"));
@@ -66,7 +98,7 @@ const ALLOWED_ORIGINS = new Set([
 ]);
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || ALLOWED_ORIGINS.has(origin)) return cb(null, true); // allow curl/postman (no origin)
+    if (!origin || ALLOWED_ORIGINS.has(origin)) return cb(null, true);
     return cb(new Error(`Origin ${origin} not allowed by CORS`));
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -75,10 +107,8 @@ app.use(cors({
 }));
 app.options("*", cors());
 
-// --- DB (use writable dir) ---
-const DB_DIR = process.env.DB_DIR || path.join(__dirname, "data");
-try { fs.ensureDirSync(DB_DIR); } catch {}
-const dbPath = path.join(DB_DIR, "linqbridge.db");
+// --- DB ---
+const dbPath = path.join(__dirname, "linqbridge.db");
 const LOG_SQL = (/^(true|1|yes)$/i).test(process.env.LOG_SQL || "false");
 const db = new Database(dbPath, LOG_SQL ? { verbose: console.log } : {});
 
@@ -137,15 +167,23 @@ function initializeDatabase() {
     );
   `);
 
-  // Connection logs
   db.exec(`
     CREATE TABLE IF NOT EXISTS connection_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_email TEXT NOT NULL,
-      level TEXT NOT NULL,      -- info | warn | error
-      event TEXT NOT NULL,      -- cookies_saved | status_soft_ok | status_live_ok | status_fail
-      details TEXT,             -- JSON/string
+      level TEXT NOT NULL,
+      event TEXT NOT NULL,
+      details TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  // NEW: secrets vault (AES-256-GCM encrypted blob per user)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS li_secrets (
+      user_email TEXT PRIMARY KEY,
+      secret_blob TEXT NOT NULL,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
   `);
 
@@ -161,7 +199,7 @@ function initializeDatabase() {
     WHERE profile_url IS NOT NULL;
   `);
 
-  console.log("Database initialized at:", dbPath);
+  console.log("Database initialized.");
 }
 initializeDatabase();
 
@@ -236,19 +274,13 @@ function derivePublicFromSalesNav(salesNavUrl) {
   return null;
 }
 
-function isPublicInUrl(u = "") {
-  try { const url = new URL(u); return /linkedin\.com$/i.test(url.hostname) && /\/in\//i.test(url.pathname); }
-  catch { return false; }
-}
-
-// --- Auth Middleware (JSON responses) ---
+// --- Auth Middleware ---
 function authenticateToken(req, res, next) {
-  const auth = req.headers["authorization"] || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-  if (!token) return res.status(401).json({ ok: false, error: "missing_token" });
-
+  const auth = req.headers["authorization"];
+  const token = auth && auth.split(" ")[1];
+  if (!token) return res.sendStatus(401);
   jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ ok: false, error: "invalid_token", message: err.message });
+    if (err) return res.sendStatus(403);
     req.user = user; // { email }
     next();
   });
@@ -256,27 +288,14 @@ function authenticateToken(req, res, next) {
 
 // --- Auth Endpoints ---
 app.post("/register", async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ success: false, message: "Email and password are required." });
   try {
-    const { email, password } = req.body || {};
-    if (!email || !password) {
-      return res.status(400).json({ success: false, message: "Email and password are required." });
-    }
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
-      return res.status(400).json({ success: false, message: "Invalid email format." });
-    }
     const hashed = await bcrypt.hash(password, 10);
-
-    // No crash on duplicate
-    const info = db.prepare("INSERT OR IGNORE INTO users (email, password) VALUES (?, ?)").run(email, hashed);
-    if (info.changes === 0) {
-      return res.status(409).json({ success: false, message: "User with this email already exists." });
-    }
-    return res.status(201).json({ success: true, message: "User registered successfully." });
+    const info = db.prepare("INSERT INTO users (email, password) VALUES (?, ?)").run(email, hashed);
+    if (info.changes > 0) return res.status(201).json({ success: true, message: "User registered successfully." });
+    return res.status(409).json({ success: false, message: "User with this email already exists." });
   } catch (e) {
-    const msg = String(e?.message || "");
-    if (/UNIQUE constraint failed/i.test(msg)) {
-      return res.status(409).json({ success: false, message: "User with this email already exists." });
-    }
     console.error("Register error:", e);
     return res.status(500).json({ success: false, message: "Internal server error during registration." });
   }
@@ -424,7 +443,7 @@ app.get("/jobs/stats", async (_req, res) => {
 app.post("/store-cookies", (req, res) => {
   try {
     const body = req.body || {};
-    const email = body.userEmail || body.email;       // accept userEmail OR email
+    const email = body.userEmail || body.email;
     const cookies = body.cookies || {};
     const timestamp = body.timestamp || new Date().toISOString();
     if (!email || !cookies.li_at) {
@@ -459,6 +478,111 @@ app.get("/api/me/liat", authenticateToken, (req, res) => {
   }
 });
 
+// --- Secrets: upsert (user) & fetch (worker) ---
+
+// Upsert/update secrets for the logged-in app user
+// Body: { li_username, li_password, totp_secret, proxy_server, proxy_username, proxy_password }
+app.post("/api/secrets/upsert", authenticateToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+    let existing = null;
+    try {
+      const row = db.prepare("SELECT secret_blob FROM li_secrets WHERE user_email = ?").get(email);
+      existing = row ? decryptJson(row.secret_blob) : null;
+    } catch { existing = null; }
+
+    const body = req.body || {};
+    const merged = {
+      li_username: body.li_username ?? existing?.li_username ?? null,
+      li_password: body.li_password ?? existing?.li_password ?? null,
+      totp_secret: body.totp_secret ?? existing?.totp_secret ?? null,
+      proxy_server: body.proxy_server ?? existing?.proxy_server ?? null,
+      proxy_username: body.proxy_username ?? existing?.proxy_username ?? null,
+      proxy_password: body.proxy_password ?? existing?.proxy_password ?? null,
+    };
+
+    if (!merged.li_username || !merged.li_password) {
+      return res.status(400).json({ success: false, message: "li_username and li_password are required at least once." });
+    }
+
+    const blob = encryptJson(merged);
+    db.prepare(`
+      INSERT INTO li_secrets (user_email, secret_blob, updated_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(user_email) DO UPDATE SET secret_blob=excluded.secret_blob, updated_at=CURRENT_TIMESTAMP
+    `).run(email, blob);
+
+    return res.json({ success: true, message: "Secrets saved." });
+  } catch (e) {
+    console.error("/api/secrets/upsert error:", e);
+    return res.status(500).json({ success: false, message: "Failed to save secrets." });
+  }
+});
+
+// Fetch decrypted secrets for worker (never exposed to browser)
+// Query: ?email=<app user email>
+app.get("/secrets/for-user", requireWorkerAuth, (req, res) => {
+  try {
+    const email = req.query.email;
+    if (!email) return res.status(400).json({ ok: false, error: "email required" });
+    const row = db.prepare("SELECT secret_blob FROM li_secrets WHERE user_email = ?").get(email);
+    if (!row?.secret_blob) return res.status(404).json({ ok: false, error: "no_secrets" });
+    const secret = decryptJson(row.secret_blob);
+    return res.json({
+      ok: true,
+      li_username: secret.li_username || null,
+      li_password: secret.li_password || null,
+      totp_secret: secret.totp_secret || null,
+      proxy_server: secret.proxy_server || null,
+      proxy_username: secret.proxy_username || null,
+      proxy_password: secret.proxy_password || null,
+    });
+  } catch (e) {
+    console.error("/secrets/for-user error:", e);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+// --- Simple wrapper for your Console SDK: POST /api/connect ---
+app.post("/api/connect", authenticateToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+    const { profileUrl, note = null, priority = 3 } = req.body || {};
+    if (!profileUrl) return res.status(400).json({ ok: false, error: "profileUrl required" });
+
+    const row = db.prepare(
+      "SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1"
+    ).get(email);
+
+    // Create job regardless; worker will credential-login if cookie is missing
+    const d = await readJobs();
+    const job = {
+      id: uuidv4(),
+      type: "SEND_CONNECTION",
+      payload: {
+        tenantId: "default",
+        userId: email,
+        profileUrl,
+        note,
+        cookieBundle: row?.li_at ? { li_at: row.li_at, jsessionid: row.jsessionid || null, bcookie: row.bcookie || null } : {},
+      },
+      priority,
+      status: "queued",
+      enqueuedAt: new Date().toISOString(),
+      attempts: 0,
+      lastError: null,
+    };
+    d.queued.push(job);
+    d.queued.sort((a, b) => a.priority - b.priority);
+    await writeJobs(d);
+    return res.json({ ok: true, jobId: job.id, job });
+  } catch (e) {
+    console.error("/api/connect error:", e);
+    return res.status(500).json({ ok: false, error: "Failed to enqueue connect" });
+  }
+});
+
+// Existing convenience route (kept)
 app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
@@ -468,7 +592,6 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
     const row = db.prepare(
       "SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1"
     ).get(email);
-    if (!row?.li_at) return res.status(404).json({ error: "No li_at stored. Capture cookies first." });
 
     const d = await readJobs();
     const job = {
@@ -479,7 +602,7 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
         userId: email,
         profileUrl,
         note,
-        cookieBundle: { li_at: row.li_at, jsessionid: row.jsessionid || null, bcookie: row.bcookie || null },
+        cookieBundle: row?.li_at ? { li_at: row.li_at, jsessionid: row.jsessionid || null, bcookie: row.bcookie || null } : {},
       },
       priority,
       status: "queued",
@@ -497,92 +620,7 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
   }
 });
 
-// === Friendly API used by Console SDK ===
-// POST /api/connect  -> enqueue SEND_CONNECTION (with optional note)
-app.post("/api/connect", authenticateToken, async (req, res) => {
-  try {
-    const email = req.user.email;
-    const { profileUrl, note = null, priority = 3 } = req.body || {};
-    if (!profileUrl || !isPublicInUrl(profileUrl)) {
-      return res.status(400).json({ ok:false, error: "Valid LinkedIn /in/ profileUrl required" });
-    }
-    const row = db.prepare(
-      "SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1"
-    ).get(email);
-    if (!row?.li_at) return res.status(404).json({ ok:false, error: "No li_at stored. Capture cookies first." });
-
-    const d = await readJobs();
-    const job = {
-      id: uuidv4(),
-      type: "SEND_CONNECTION",
-      payload: {
-        tenantId: "default",
-        userId: email,
-        profileUrl,
-        note,
-        cookieBundle: { li_at: row.li_at, jsessionid: row.jsessionid || null, bcookie: row.bcookie || null },
-      },
-      priority,
-      status: "queued",
-      enqueuedAt: new Date().toISOString(),
-      attempts: 0,
-      lastError: null,
-    };
-    d.queued.push(job);
-    d.queued.sort((a, b) => a.priority - b.priority);
-    await writeJobs(d);
-    return res.json({ ok:true, job });
-  } catch (e) {
-    console.error("/api/connect error:", e);
-    return res.status(500).json({ ok:false, error: "Failed to enqueue connection" });
-  }
-});
-
-// POST /api/message -> enqueue SEND_MESSAGE
-app.post("/api/message", authenticateToken, async (req, res) => {
-  try {
-    const email = req.user.email;
-    const { profileUrl, message, priority = 3 } = req.body || {};
-    if (!profileUrl || !isPublicInUrl(profileUrl)) {
-      return res.status(400).json({ ok:false, error: "Valid LinkedIn /in/ profileUrl required" });
-    }
-    if (!message || !String(message).trim()) {
-      return res.status(400).json({ ok:false, error: "message required" });
-    }
-    const row = db.prepare(
-      "SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1"
-    ).get(email);
-    if (!row?.li_at) return res.status(404).json({ ok:false, error: "No li_at stored. Capture cookies first." });
-
-    const d = await readJobs();
-    const job = {
-      id: uuidv4(),
-      type: "SEND_MESSAGE",
-      payload: {
-        tenantId: "default",
-        userId: email,
-        profileUrl,
-        message,
-        cookieBundle: { li_at: row.li_at, jsessionid: row.jsessionid || null, bcookie: row.bcookie || null },
-      },
-      priority,
-      status: "queued",
-      enqueuedAt: new Date().toISOString(),
-      attempts: 0,
-      lastError: null,
-    };
-    d.queued.push(job);
-    d.queued.sort((a, b) => a.priority - b.priority);
-    await writeJobs(d);
-    return res.json({ ok:true, job });
-  } catch (e) {
-    console.error("/api/message error:", e);
-    return res.status(500).json({ ok:false, error: "Failed to enqueue message" });
-  }
-});
-// === END Friendly API ===
-
-// --- Leads upload (accept userEmail OR email) ---
+// --- Leads upload / Leads / Excel / Automation (unchanged) ---
 app.post("/upload-leads", async (req, res) => {
   if (process.env.LOG_UPLOADS === "true") console.log("Received /upload-leads");
   const { leads, timestamp } = req.body || {};
@@ -668,7 +706,6 @@ app.post("/upload-leads", async (req, res) => {
   });
 });
 
-// --- Leads / Excel / Automation ---
 app.get("/api/leads", authenticateToken, (req, res) => {
   try {
     const rows = db.prepare("SELECT * FROM leads WHERE user_email = ? ORDER BY scraped_at DESC").all(req.user.email);
@@ -718,6 +755,7 @@ app.get("/download-leads-excel", authenticateToken, async (req, res) => {
   }
 });
 
+// --- Automation status / logs ---
 app.get("/api/automation/get-next-leads", authenticateToken, (req, res) => {
   const limit = parseInt(req.query.limit || "1", 10);
   const email = req.user.email;
@@ -840,23 +878,23 @@ app.get("/api/connection/check", authenticateToken, async (req, res) => {
       "SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1"
     ).get(email);
 
-    if (!row?.li_at) {
+    if (!row?.li_at && !wantLive) {
       logConn(email, "warn", "status_fail", { reason: "no_li_at" });
       return res.json({
         connected: false,
         mode: "none",
-        reason: "No li_at cookie on server. Capture cookies from the extension."
+        reason: "No li_at cookie on server. Capture cookies from the extension or store credentials."
       });
     }
 
     if (!wantLive) {
       logConn(email, "info", "status_soft_ok", {
-        has_li_at: true,
-        has_jsessionid: !!row.jsessionid,
-        has_bcookie: !!row.bcookie
+        has_li_at: !!row?.li_at,
+        has_jsessionid: !!row?.jsessionid,
+        has_bcookie: !!row?.bcookie
       });
       return res.json({
-        connected: "stored",
+        connected: row?.li_at ? "stored" : false,
         mode: "soft",
         hint: "Click Verify in the dashboard to run a live check."
       });
@@ -873,12 +911,12 @@ app.get("/api/connection/check", authenticateToken, async (req, res) => {
       return res.json({ connected: "stored", mode: "cooldown", cooldownMs: msLeft });
     }
 
-    const js = (row.jsessionid || "").replace(/^"|"$/g, "");
+    const js = (row?.jsessionid || "").replace(/^"|"$/g, "");
     const csrf = js || "ajax:123456789";
     const cookieHeader = [
-      `li_at=${row.li_at}`,
+      row?.li_at ? `li_at=${row.li_at}` : null,
       js ? `JSESSIONID="${js}"` : null,
-      row.bcookie ? `bcookie=${row.bcookie}` : null
+      row?.bcookie ? `bcookie=${row.bcookie}` : null
     ].filter(Boolean).join("; ");
 
     const url = "https://www.linkedin.com/voyager/api/me";
@@ -944,11 +982,10 @@ app.get("/api/connection/logs", authenticateToken, (req, res) => {
   }
 });
 
-// --- Connect flow endpoints (UI -> backend) ---
+// --- Connect flow (start/test/status) ---
 app.post("/api/connect/start", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
-    // Enqueue AUTH_CHECK for this user. Worker will save storageState per userId=email.
     const d = await readJobs();
     const job = {
       id: uuidv4(),
@@ -964,7 +1001,6 @@ app.post("/api/connect/start", authenticateToken, async (req, res) => {
     d.queued.sort((a, b) => a.priority - b.priority);
     await writeJobs(d);
 
-    // Compose viewer URL if configured
     const viewerUrl = VIEWER_BASE_URL
       ? `${VIEWER_BASE_URL.replace(/\/+$/,"")}/vnc_lite.html?autoconnect=1&view_only=0&password=${encodeURIComponent(NOVNC_PASSWORD)}`
       : null;
@@ -994,7 +1030,7 @@ app.post("/api/connect/test", authenticateToken, async (req, res) => {
     const job = {
       id: uuidv4(),
       type: "AUTH_CHECK",
-      payload: { tenantId: "default", userId: email }, // same as start; worker will just verify & re-save if needed
+      payload: { tenantId: "default", userId: email },
       priority: 2,
       status: "queued",
       enqueuedAt: new Date().toISOString(),

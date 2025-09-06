@@ -3,7 +3,7 @@
 /* More badge states */
 .badge.cooldown { background: var(--info-bg);  color: var(--info-text);  border-color: #c7d2fe; }
 .badge.warn     { background: var(--warn-bg);  color: var(--warn-text);  border-color: #fed7aa; }
-.badge.paused   { background: #f1f5f9;         color: #475569;          border-color: var(--border); }
+.badge.paused   { background: #ffffff;         color: #475569;          border-color: var(--border); }
 
 /* Small status dot (use with text) */
 .status {
