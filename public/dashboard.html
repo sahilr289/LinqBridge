@@ -18,15 +18,15 @@
       </div>
 
       <div id="login-form" class="form form-active">
-        <input type="email" id="login-email" placeholder="Email" autocomplete="username" />
-        <input type="password" id="login-password" placeholder="Password" autocomplete="current-password" />
+        <input type="email" id="login-email" placeholder="Email" />
+        <input type="password" id="login-password" placeholder="Password" />
         <button id="login-btn" class="btn primary">Log In</button>
       </div>
 
       <div id="register-form" class="form">
-        <input type="email" id="reg-email" placeholder="Email" autocomplete="email" />
-        <input type="password" id="reg-password" placeholder="Password" autocomplete="new-password" />
-        <input type="password" id="reg-password2" placeholder="Confirm Password" autocomplete="new-password" />
+        <input type="email" id="reg-email" placeholder="Email" />
+        <input type="password" id="reg-password" placeholder="Password" />
+        <input type="password" id="reg-password2" placeholder="Confirm Password" />
         <button id="register-btn" class="btn">Create Account</button>
       </div>
 
@@ -78,13 +78,13 @@
         <div class="section">
           <h3>Connect your LinkedIn</h3>
           <p class="help">
-            You’ll log in directly on LinkedIn in a secure browser. We never see your password or 2FA codes.
+            You’ll log in directly on LinkedIn in a secure browser, or the worker can use your saved credentials. We never expose your credentials back to the UI once saved.
           </p>
 
           <div class="row" style="margin:10px 0;">
             <button id="connect-start-btn" class="btn primary">Login via secure browser</button>
             <button id="connect-test-btn" class="btn">Test connection</button>
-            <a id="open-viewer-link" class="btn secondary" href="#" target="_blank" rel="noopener noreferrer">Open viewer</a>
+            <a id="open-viewer-link" class="btn secondary" href="#" target="_blank" rel="noreferrer">Open viewer</a>
 
             <span id="conn-spinner" class="spinner" style="display:none;"></span>
             <span class="status">
@@ -97,10 +97,66 @@
           <div id="conn-msg" class="msg info" style="display:none;"></div>
 
           <hr class="hr"/>
-
           <p class="help">
-            Optional: if your Chrome extension already captured cookies (li_at, JSESSIONID, bcookie), we’ll also use them to help resolve Sales Navigator URLs. You can still use the secure browser login flow above for safer, persistent sessions.
+            Optional: if your Chrome extension captured cookies (li_at, JSESSIONID, bcookie), we’ll use them too. Or use the forms below to store credentials/TOTP/proxy (Sprouts-style).
           </p>
+        </div>
+
+        <!-- NEW: Account Settings (Sprouts-style) -->
+        <div class="section">
+          <h3>LinkedIn Account (stored securely)</h3>
+          <div id="acct-msg" class="msg" style="display:none;"></div>
+
+          <div class="grid-2" style="margin-top:8px;">
+            <div class="stack">
+              <label class="help">LinkedIn Username (email)</label>
+              <input id="li-username" type="text" placeholder="e.g. you@example.com"/>
+            </div>
+            <div class="stack">
+              <label class="help">LinkedIn Password</label>
+              <input id="li-password" type="password" placeholder="••••••••"/>
+            </div>
+          </div>
+          <div class="row" style="margin-top:8px;">
+            <button id="save-creds-btn" class="btn">Save Credentials</button>
+            <span id="creds-status" class="help"></span>
+          </div>
+
+          <div class="grid-2" style="margin-top:16px;">
+            <div class="stack">
+              <label class="help">TOTP Secret (for 2-Step)</label>
+              <input id="totp-secret" type="text" placeholder="Base32 secret from your authenticator"/>
+            </div>
+            <div class="stack">
+              <label class="help">—</label>
+              <button id="save-totp-btn" class="btn">Save TOTP Secret</button>
+            </div>
+          </div>
+          <div><span id="totp-status" class="help"></span></div>
+
+          <div class="grid-2" style="margin-top:16px;">
+            <div class="stack">
+              <label class="help">Proxy server</label>
+              <input id="proxy-server" type="text" placeholder="http://host:port or socks5://host:port"/>
+            </div>
+            <div class="stack">
+              <label class="help">Proxy username (optional)</label>
+              <input id="proxy-username" type="text" placeholder="user"/>
+            </div>
+          </div>
+          <div class="grid-2" style="margin-top:8px;">
+            <div class="stack">
+              <label class="help">Proxy password (optional)</label>
+              <input id="proxy-password" type="password" placeholder="••••••••"/>
+            </div>
+            <div class="stack">
+              <label class="help">—</label>
+              <button id="save-proxy-btn" class="btn">Save Proxy</button>
+            </div>
+          </div>
+          <div><span id="proxy-status" class="help"></span></div>
+
+          <div class="help" id="settings-updated-at" style="margin-top:8px;"></div>
         </div>
 
         <div class="section">
@@ -124,6 +180,6 @@
     </div>
   </div>
 
-  <script src="dashboard.js" defer></script>
+  <script src="dashboard.js"></script>
 </body>
 </html>

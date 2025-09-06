@@ -1,4 +1,4 @@
-// dashboard.js — LinqBridge Dashboard (Leads + Connect LinkedIn with viewer + job polling)
+// dashboard.js — LinqBridge Dashboard (Leads + Connect + Sprouts-style account settings)
 
 const API_BASE = ""; // same-origin (served by your backend)
 const LS_TOKEN = "lb_token";
@@ -11,6 +11,8 @@ function hide(el) { if (el) el.style.display = "none"; }
 function setText(el, txt) { if (el) el.textContent = txt; }
 function setAttr(el, k, v) { if (el) el.setAttribute(k, v); }
 function hasEl(id) { return !!$(id); }
+function val(id) { const el = $(id); return el ? el.value : ""; }
+function setVal(id, v) { const el = $(id); if (el) el.value = v ?? ""; }
 
 function setMsg(el, text, type = "info") {
   if (!el) return;
@@ -24,7 +26,6 @@ function clearMsg(el) {
   hide(el);
 }
 
-// ---------- robust fetch wrapper ----------
 async function api(path, { method = "GET", headers = {}, body } = {}) {
   const token = localStorage.getItem(LS_TOKEN);
   const finalHeaders = {
@@ -32,39 +33,21 @@ async function api(path, { method = "GET", headers = {}, body } = {}) {
     ...(token ? { "Authorization": `Bearer ${token}` } : {}),
     ...headers
   };
-  const url = path.startsWith("/") ? API_BASE + path : API_BASE + "/" + path;
-
-  let res;
-  try {
-    res = await fetch(url, { method, headers: finalHeaders, body });
-  } catch (e) {
-    throw new Error("Network error. Please check your connection.");
-  }
-
-  const text = await res.text();
+  const res = await fetch(path.startsWith("/") ? API_BASE + path : API_BASE + "/" + path, {
+    method,
+    headers: finalHeaders,
+    body
+  });
   const ct = res.headers.get("content-type") || "";
-
-  // Parse JSON when possible
-  const parsed = ct.includes("application/json")
-    ? (() => { try { return JSON.parse(text); } catch { return null; } })()
-    : null;
-
-  // Handle auth failures globally
-  if (res.status === 401) {
-    // token expired/invalid -> force logout UX
-    localStorage.removeItem(LS_TOKEN);
-    localStorage.removeItem(LS_EMAIL);
-    throw new Error(parsed?.message || "Unauthorized. Please log in again.");
+  const text = await res.text();
+  if (!ct.includes("application/json")) {
+    // Pass through raw on error
+    if (!res.ok) throw new Error(text || `HTTP ${res.status}`);
+    return { _raw: text, _status: res.status };
   }
-
-  // For any non-OK, throw a readable error even if plain text/HTML
-  if (!res.ok) {
-    const msg = parsed?.error || parsed?.message || text?.slice(0, 160) || `HTTP ${res.status}`;
-    throw new Error(msg);
-  }
-
-  // OK: prefer JSON; else return raw
-  return parsed ?? { _raw: text, _status: res.status };
+  const json = JSON.parse(text);
+  if (!res.ok) throw new Error(json.error || json.message || `HTTP ${res.status}`);
+  return json;
 }
 
 // ---------- auth wiring ----------
@@ -168,7 +151,7 @@ function renderLeadsTable(rows) {
       const t = document.createElement("td");
       if (typeof v === "string" && v.startsWith("http")) {
         const a = document.createElement("a");
-        a.href = v; a.target = "_blank"; a.rel = "noopener noreferrer"; a.textContent = v;
+        a.href = v; a.target = "_blank"; a.textContent = v;
         t.appendChild(a);
       } else {
         t.textContent = v ?? "";
@@ -211,63 +194,36 @@ async function downloadExcel() {
 let connectJobId = null;
 let connectPollTimer = null;
 let lastViewerUrl = null;
-let pollAttempts = 0;
-const MAX_POLL_ATTEMPTS = 300; // ~10 minutes at 2s interval
-let pollIntervalMs = 2000;
 
 function setConnVisual({ state = "idle", text = "Not linked", badge = null, dot = null, spinning = false, msg = null, msgType = "info" } = {}) {
-  // Dot + text
   const dotEl = $("conn-dot");
   const txtEl = $("conn-status-text");
-  if (dotEl) {
-    dotEl.className = "dot" + (dot ? " " + dot : "");
-  }
+  if (dotEl) dotEl.className = "dot" + (dot ? " " + dot : "");
   if (txtEl) setText(txtEl, text);
 
-  // Badge (optional)
   const badgeEl = $("conn-status");
-  if (badgeEl) {
-    if (badge) {
-      badgeEl.className = "badge " + badge;
-      show(badgeEl);
-    } else {
-      hide(badgeEl);
-    }
-  }
+  if (badgeEl) { badge ? (badgeEl.className = "badge " + badge, show(badgeEl)) : hide(badgeEl); }
 
-  // Spinner
   const spinner = $("conn-spinner");
   if (spinner) spinning ? show(spinner) : hide(spinner);
 
-  // Message
   const msgEl = $("conn-msg");
-  if (msgEl) {
-    if (msg) setMsg(msgEl, msg, msgType);
-    else clearMsg(msgEl);
-  }
+  if (msgEl) { msg ? setMsg(msgEl, msg, msgType) : clearMsg(msgEl); }
 }
 
 async function startConnectFlow() {
   try {
-    setConnVisual({
-      state: "linking",
-      text: "Linking… complete login + 2FA",
-      dot: "info",
-      spinning: true,
-      msg: "A secure browser will open. Sign in to LinkedIn and finish 2FA, then leave this tab open while we verify."
-    });
-
+    setConnVisual({ state: "linking", text: "Linking… complete login + 2FA", dot: "info", spinning: true, msg: "A secure browser will open. Sign in to LinkedIn and finish 2FA." });
     const res = await api("/api/connect/start", { method: "POST" });
     connectJobId = res.jobId || null;
     lastViewerUrl = res.viewerUrl || null;
 
     if (hasEl("open-viewer-link") && lastViewerUrl) {
       setAttr($("open-viewer-link"), "href", lastViewerUrl);
-      // Try to open a new tab; pop-up blockers may prevent this
-      try { window.open(lastViewerUrl, "_blank", "noopener"); } catch {}
+      window.open(lastViewerUrl, "_blank", "noopener");
     }
 
-    beginConnectPolling(true);
+    beginConnectPolling();
   } catch (e) {
     setConnVisual({ state: "error", text: "Error", dot: "fail", spinning: false, msg: e.message || "Failed to start connect.", msgType: "error" });
   }
@@ -278,41 +234,20 @@ async function testConnectFlow() {
     setConnVisual({ state: "testing", text: "Verifying session…", dot: "info", spinning: true });
     const res = await api("/api/connect/test", { method: "POST" });
     connectJobId = res.jobId || null;
-    beginConnectPolling(true);
+    beginConnectPolling();
   } catch (e) {
     setConnVisual({ state: "error", text: "Error", dot: "fail", spinning: false, msg: e.message || "Failed to start test.", msgType: "error" });
   }
 }
 
-function beginConnectPolling(reset = false) {
+function beginConnectPolling() {
   if (!connectJobId) return;
   if (connectPollTimer) clearInterval(connectPollTimer);
-  if (reset) { pollAttempts = 0; pollIntervalMs = 2000; }
-  connectPollTimer = setInterval(pollConnectStatus, pollIntervalMs);
-}
-
-function stopPolling() {
-  if (connectPollTimer) clearInterval(connectPollTimer);
-  connectPollTimer = null;
+  connectPollTimer = setInterval(pollConnectStatus, 2000);
 }
 
 async function pollConnectStatus() {
-  if (!connectJobId) return stopPolling();
-  // Hard stop to prevent runaway polling
-  if (++pollAttempts > MAX_POLL_ATTEMPTS) {
-    stopPolling();
-    setConnVisual({
-      state: "timeout",
-      text: "Timed out",
-      dot: "warn",
-      spinning: false,
-      badge: "warn",
-      msg: "Login/browser step took too long. Please try again.",
-      msgType: "warning"
-    });
-    return;
-  }
-
+  if (!connectJobId) return;
   try {
     const r = await api(`/api/connect/status/${connectJobId}`, { method: "GET" });
     const job = r.job || {};
@@ -322,48 +257,29 @@ async function pollConnectStatus() {
     const ok = result.ok === true;
 
     if (pool === "done" || status === "done" || ok) {
-      stopPolling(); connectJobId = null;
-      setConnVisual({
-        state: "linked",
-        text: "Linked ✓ (valid)",
-        dot: "ok",
-        spinning: false,
-        badge: "ok",
-        msg: "Authenticated. You can start automation now.",
-        msgType: "success"
-      });
+      clearInterval(connectPollTimer); connectPollTimer = null; connectJobId = null;
+      setConnVisual({ state: "linked", text: "Linked ✓ (valid)", dot: "ok", spinning: false, badge: "ok", msg: "Authenticated. You can start automation now.", msgType: "success" });
       return;
     }
-
     if (pool === "failed" || status === "failed") {
-      stopPolling(); connectJobId = null;
+      clearInterval(connectPollTimer); connectPollTimer = null; connectJobId = null;
       const details = (result && (result.details || result.reason)) || job.lastError || "Action needed. Re-authenticate.";
-      setConnVisual({
-        state: "action_needed",
-        text: "Action needed",
-        dot: "warn",
-        spinning: false,
-        badge: "warn",
-        msg: details.toString(),
-        msgType: "warning"
-      });
+      setConnVisual({ state: "action_needed", text: "Action needed", dot: "warn", spinning: false, badge: "warn", msg: details.toString(), msgType: "warning" });
       return;
     }
 
-    // still running -> keep the status visible
     setConnVisual({ state: "linking", text: "Linking… complete login + 2FA", dot: "info", spinning: true });
-
   } catch (e) {
-    stopPolling(); connectJobId = null;
+    clearInterval(connectPollTimer); connectPollTimer = null; connectJobId = null;
     setConnVisual({ state: "error", text: "Error", dot: "fail", spinning: false, msg: e.message || "Polling error.", msgType: "error" });
   }
 }
 
-// Legacy/aux soft check
+// Legacy soft check
 async function checkConnection() {
   try {
     setConnVisual({ state: "checking", text: "Checking…", dot: "info", spinning: true });
-    const data = await api("/api/connection/check"); // soft by default
+    const data = await api("/api/connection/check");
     if (data.connected === true) {
       setConnVisual({
         state: "linked",
@@ -391,7 +307,6 @@ async function checkConnection() {
         text: "Cookies stored",
         dot: "info",
         spinning: false,
-        badge: null,
         msg: data.hint || "Stored cookies found. For a durable session, use Login via secure browser.",
         msgType: "info"
       });
@@ -430,6 +345,70 @@ async function loadLogs() {
   }
 }
 
+// ---------- Account settings (Sprouts-style) ----------
+async function loadAccountSettings() {
+  try {
+    const r = await api("/api/account/settings");
+    const s = r.settings || {};
+    setText($("creds-status"), s.username === "saved" && s.password === "saved" ? "Credentials: saved" :
+      (s.username === "saved" || s.password === "saved" ? "Credentials: partially saved" : "Credentials: not saved"));
+    setText($("totp-status"), s.totp === "saved" ? "TOTP: saved" : "TOTP: not set");
+    const px = s.proxy || {};
+    setText($("proxy-status"), px.server ? `Proxy: ${px.server} (${px.username === "saved" ? "auth set" : "no auth"})` : "Proxy: not set");
+    setText($("settings-updated-at"), s.updated_at ? `Last updated: ${new Date(s.updated_at).toLocaleString()}` : "");
+    // do not prefill username/password/totp for safety; keep inputs blank
+  } catch (e) {
+    setMsg($("acct-msg"), e.message || "Failed to load account settings.", "error");
+  }
+}
+
+async function saveCreds() {
+  const msg = $("acct-msg");
+  clearMsg(msg);
+  const username = val("li-username").trim();
+  const password = val("li-password");
+  if (!username || !password) return setMsg(msg, "Enter both username and password.", "error");
+  try {
+    await api("/api/account/creds", { method: "POST", body: JSON.stringify({ username, password }) });
+    setVal("li-password", "");
+    setMsg(msg, "Credentials saved.", "success");
+    await loadAccountSettings();
+  } catch (e) {
+    setMsg(msg, e.message || "Failed to save credentials.", "error");
+  }
+}
+
+async function saveTotp() {
+  const msg = $("acct-msg");
+  clearMsg(msg);
+  const totpSecret = val("totp-secret").trim();
+  if (!totpSecret) return setMsg(msg, "Enter your TOTP secret.", "error");
+  try {
+    await api("/api/account/totp", { method: "POST", body: JSON.stringify({ totpSecret }) });
+    setVal("totp-secret", "");
+    setMsg(msg, "TOTP secret saved.", "success");
+    await loadAccountSettings();
+  } catch (e) {
+    setMsg(msg, e.message || "Failed to save TOTP.", "error");
+  }
+}
+
+async function saveProxy() {
+  const msg = $("acct-msg");
+  clearMsg(msg);
+  const server = val("proxy-server").trim();
+  const username = val("proxy-username").trim();
+  const password = val("proxy-password");
+  try {
+    await api("/api/account/proxy", { method: "POST", body: JSON.stringify({ server, username, password }) });
+    setVal("proxy-password", "");
+    setMsg(msg, "Proxy settings saved.", "success");
+    await loadAccountSettings();
+  } catch (e) {
+    setMsg(msg, e.message || "Failed to save proxy.", "error");
+  }
+}
+
 // ---------- app show/hide ----------
 function showApp() {
   const email = localStorage.getItem(LS_EMAIL) || "";
@@ -455,32 +434,31 @@ document.addEventListener("DOMContentLoaded", () => {
   $("app-tab-leads")?.addEventListener("click", () => switchAppView("leads"));
   $("app-tab-connection")?.addEventListener("click", () => {
     switchAppView("connection");
+    // refresh status, logs, and account settings
     checkConnection();
     loadLogs();
+    loadAccountSettings();
   });
 
   // leads actions
   $("reload-btn")?.addEventListener("click", loadLeads);
   $("download-btn")?.addEventListener("click", downloadExcel);
 
-  // connect flow buttons
+  // connect flow
   $("connect-start-btn")?.addEventListener("click", startConnectFlow);
   $("connect-test-btn")?.addEventListener("click", testConnectFlow);
 
-  // Optional legacy button:
-  $("check-conn-btn")?.addEventListener("click", checkConnection);
+  // account settings actions
+  $("save-creds-btn")?.addEventListener("click", saveCreds);
+  $("save-totp-btn")?.addEventListener("click", saveTotp);
+  $("save-proxy-btn")?.addEventListener("click", saveProxy);
 
-  // Ensure viewer link shows last known URL if page reloads (will be null first load)
-  if (hasEl("open-viewer-link") && lastViewerUrl) {
-    setAttr($("open-viewer-link"), "href", lastViewerUrl);
-  } else if (hasEl("open-viewer-link")) {
+  // prevent empty viewer href
+  if (hasEl("open-viewer-link") && !lastViewerUrl) {
     $("open-viewer-link").addEventListener("click", (e) => {
       if (!lastViewerUrl) e.preventDefault();
     });
   }
-
-  // stop polling when navigating away
-  window.addEventListener("beforeunload", stopPolling);
 
   // autologin if token exists
   if (localStorage.getItem(LS_TOKEN)) {
