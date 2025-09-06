@@ -1,4 +1,4 @@
-// index.js — LinqBridge backend (FINAL: quieter logs, Connect flow endpoints + job lookup)
+// index.js — LinqBridge backend (FINAL)
 
 const express = require("express");
 const cors = require("cors");
@@ -75,8 +75,10 @@ app.use(cors({
 }));
 app.options("*", cors());
 
-// --- DB ---
-const dbPath = path.join(__dirname, "linqbridge.db");
+// --- DB (use writable dir) ---
+const DB_DIR = process.env.DB_DIR || path.join(__dirname, "data");
+try { fs.ensureDirSync(DB_DIR); } catch {}
+const dbPath = path.join(DB_DIR, "linqbridge.db");
 const LOG_SQL = (/^(true|1|yes)$/i).test(process.env.LOG_SQL || "false");
 const db = new Database(dbPath, LOG_SQL ? { verbose: console.log } : {});
 
@@ -159,7 +161,7 @@ function initializeDatabase() {
     WHERE profile_url IS NOT NULL;
   `);
 
-  console.log("Database initialized.");
+  console.log("Database initialized at:", dbPath);
 }
 initializeDatabase();
 
@@ -239,13 +241,14 @@ function isPublicInUrl(u = "") {
   catch { return false; }
 }
 
-// --- Auth Middleware ---
+// --- Auth Middleware (JSON responses) ---
 function authenticateToken(req, res, next) {
-  const auth = req.headers["authorization"];
-  const token = auth && auth.split(" ")[1];
-  if (!token) return res.sendStatus(401);
+  const auth = req.headers["authorization"] || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return res.status(401).json({ ok: false, error: "missing_token" });
+
   jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.sendStatus(403);
+    if (err) return res.status(403).json({ ok: false, error: "invalid_token", message: err.message });
     req.user = user; // { email }
     next();
   });
@@ -253,14 +256,27 @@ function authenticateToken(req, res, next) {
 
 // --- Auth Endpoints ---
 app.post("/register", async (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ success: false, message: "Email and password are required." });
   try {
+    const { email, password } = req.body || {};
+    if (!email || !password) {
+      return res.status(400).json({ success: false, message: "Email and password are required." });
+    }
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      return res.status(400).json({ success: false, message: "Invalid email format." });
+    }
     const hashed = await bcrypt.hash(password, 10);
-    const info = db.prepare("INSERT INTO users (email, password) VALUES (?, ?)").run(email, hashed);
-    if (info.changes > 0) return res.status(201).json({ success: true, message: "User registered successfully." });
-    return res.status(409).json({ success: false, message: "User with this email already exists." });
+
+    // No crash on duplicate
+    const info = db.prepare("INSERT OR IGNORE INTO users (email, password) VALUES (?, ?)").run(email, hashed);
+    if (info.changes === 0) {
+      return res.status(409).json({ success: false, message: "User with this email already exists." });
+    }
+    return res.status(201).json({ success: true, message: "User registered successfully." });
   } catch (e) {
+    const msg = String(e?.message || "");
+    if (/UNIQUE constraint failed/i.test(msg)) {
+      return res.status(409).json({ success: false, message: "User with this email already exists." });
+    }
     console.error("Register error:", e);
     return res.status(500).json({ success: false, message: "Internal server error during registration." });
   }
@@ -481,7 +497,7 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
   }
 });
 
-// === NEW: Friendly API used by Console SDK ===
+// === Friendly API used by Console SDK ===
 // POST /api/connect  -> enqueue SEND_CONNECTION (with optional note)
 app.post("/api/connect", authenticateToken, async (req, res) => {
   try {
@@ -564,7 +580,7 @@ app.post("/api/message", authenticateToken, async (req, res) => {
     return res.status(500).json({ ok:false, error: "Failed to enqueue message" });
   }
 });
-// === END NEW ===
+// === END Friendly API ===
 
 // --- Leads upload (accept userEmail OR email) ---
 app.post("/upload-leads", async (req, res) => {
