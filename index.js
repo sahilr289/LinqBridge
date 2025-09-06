@@ -234,6 +234,11 @@ function derivePublicFromSalesNav(salesNavUrl) {
   return null;
 }
 
+function isPublicInUrl(u = "") {
+  try { const url = new URL(u); return /linkedin\.com$/i.test(url.hostname) && /\/in\//i.test(url.pathname); }
+  catch { return false; }
+}
+
 // --- Auth Middleware ---
 function authenticateToken(req, res, next) {
   const auth = req.headers["authorization"];
@@ -475,6 +480,91 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
     res.status(500).json({ error: "Failed to enqueue" });
   }
 });
+
+// === NEW: Friendly API used by Console SDK ===
+// POST /api/connect  -> enqueue SEND_CONNECTION (with optional note)
+app.post("/api/connect", authenticateToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+    const { profileUrl, note = null, priority = 3 } = req.body || {};
+    if (!profileUrl || !isPublicInUrl(profileUrl)) {
+      return res.status(400).json({ ok:false, error: "Valid LinkedIn /in/ profileUrl required" });
+    }
+    const row = db.prepare(
+      "SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1"
+    ).get(email);
+    if (!row?.li_at) return res.status(404).json({ ok:false, error: "No li_at stored. Capture cookies first." });
+
+    const d = await readJobs();
+    const job = {
+      id: uuidv4(),
+      type: "SEND_CONNECTION",
+      payload: {
+        tenantId: "default",
+        userId: email,
+        profileUrl,
+        note,
+        cookieBundle: { li_at: row.li_at, jsessionid: row.jsessionid || null, bcookie: row.bcookie || null },
+      },
+      priority,
+      status: "queued",
+      enqueuedAt: new Date().toISOString(),
+      attempts: 0,
+      lastError: null,
+    };
+    d.queued.push(job);
+    d.queued.sort((a, b) => a.priority - b.priority);
+    await writeJobs(d);
+    return res.json({ ok:true, job });
+  } catch (e) {
+    console.error("/api/connect error:", e);
+    return res.status(500).json({ ok:false, error: "Failed to enqueue connection" });
+  }
+});
+
+// POST /api/message -> enqueue SEND_MESSAGE
+app.post("/api/message", authenticateToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+    const { profileUrl, message, priority = 3 } = req.body || {};
+    if (!profileUrl || !isPublicInUrl(profileUrl)) {
+      return res.status(400).json({ ok:false, error: "Valid LinkedIn /in/ profileUrl required" });
+    }
+    if (!message || !String(message).trim()) {
+      return res.status(400).json({ ok:false, error: "message required" });
+    }
+    const row = db.prepare(
+      "SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1"
+    ).get(email);
+    if (!row?.li_at) return res.status(404).json({ ok:false, error: "No li_at stored. Capture cookies first." });
+
+    const d = await readJobs();
+    const job = {
+      id: uuidv4(),
+      type: "SEND_MESSAGE",
+      payload: {
+        tenantId: "default",
+        userId: email,
+        profileUrl,
+        message,
+        cookieBundle: { li_at: row.li_at, jsessionid: row.jsessionid || null, bcookie: row.bcookie || null },
+      },
+      priority,
+      status: "queued",
+      enqueuedAt: new Date().toISOString(),
+      attempts: 0,
+      lastError: null,
+    };
+    d.queued.push(job);
+    d.queued.sort((a, b) => a.priority - b.priority);
+    await writeJobs(d);
+    return res.json({ ok:true, job });
+  } catch (e) {
+    console.error("/api/message error:", e);
+    return res.status(500).json({ ok:false, error: "Failed to enqueue message" });
+  }
+});
+// === END NEW ===
 
 // --- Leads upload (accept userEmail OR email) ---
 app.post("/upload-leads", async (req, res) => {
@@ -723,7 +813,6 @@ app.post("/api/automation/update-status", authenticateToken, (req, res) => {
 });
 
 // --- Connection status & logs ---
-// Default = SOFT (no LinkedIn call). Live check only via ?live=1 with 10-min cooldown.
 const LIVE_CHECK_COOLDOWN_MS = 10 * 60 * 1000;
 
 app.get("/api/connection/check", authenticateToken, async (req, res) => {
