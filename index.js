@@ -1,4 +1,4 @@
-// index.js — LinqBridge backend (FINAL with RapidAPI public URL resolution + "Sprouts-mode": creds+TOTP+proxy storage, worker fetch)
+// index.js — LinqBridge backend (FINAL with RapidAPI person-resolution + Sprouts-mode)
 
 const express = require("express");
 const cors = require("cors");
@@ -21,6 +21,14 @@ const ENC_SECRET = process.env.ENC_SECRET || "change_me_32+chars_in_prod";
 // --- Optional viewer info for Connect flow ---
 const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || "";     // e.g. https://linqbridge-worker-xxxx.up.railway.app
 const NOVNC_PASSWORD  = process.env.NOVNC_PASSWORD  || "changeme123";
+
+// --- RapidAPI config ---
+const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || ""; // <<< set this in Railway
+const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || "linkedin-data-api.p.rapidapi.com"; // rockapis
+const RAPIDAPI_STRATEGY = process.env.RAPIDAPI_STRATEGY || "rapidapi-first"; // rapidapi-first | cookies-first
+const RAPIDAPI_GEO = process.env.RAPIDAPI_GEO || ""; // e.g. "103644278" (United States). You can put multiple: "103644278,101165590"
+const RAPIDAPI_TIMEOUT_MS = parseInt(process.env.RAPIDAPI_TIMEOUT_MS || "10000", 10);
+const RAPIDAPI_DEBUG = /^(1|true|yes)$/i.test(process.env.RAPIDAPI_DEBUG || "0");
 
 // --- File-backed Job Queue ---
 const DATA_DIR = path.join(__dirname, "data");
@@ -203,18 +211,16 @@ function dec(blob) {
   return decd.toString("utf8");
 }
 
-// --- Helpers ---
+// --- Misc helpers ---
+async function safeText(res) { try { return await res.text(); } catch { return ""; } }
 function logConn(email, level, event, detailsObj) {
   try {
-    db.prepare(`
-      INSERT INTO connection_logs (user_email, level, event, details)
-      VALUES (?, ?, ?, ?)
-    `).run(email, level, event, detailsObj ? JSON.stringify(detailsObj) : null);
+    db.prepare(`INSERT INTO connection_logs (user_email, level, event, details) VALUES (?, ?, ?, ?)`)
+      .run(email, level, event, detailsObj ? JSON.stringify(detailsObj) : null);
   } catch (e) {
     console.warn("logConn error:", e.message);
   }
 }
-
 function getLatestLiAtForUser(email) {
   try {
     const row = db.prepare("SELECT li_at FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1").get(email);
@@ -224,12 +230,18 @@ function getLatestLiAtForUser(email) {
     return null;
   }
 }
-
 function extractFsSalesProfileId(salesNavUrl = "") {
   const m = salesNavUrl.match(/fs_salesProfile:(\d+)/) || salesNavUrl.match(/fs_salesProfile:\((\d+)\)/);
   return m ? m[1] : null;
 }
+function derivePublicFromSalesNav(salesNavUrl) {
+  if (!salesNavUrl) return null;
+  const m = salesNavUrl.match(/\/sales\/lead\/([^,\/\?]+)/i);
+  if (m && m[1]) return `https://www.linkedin.com/in/${m[1]}`;
+  return null;
+}
 
+// Try LinkedIn Sales API (with cookies)
 async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
   if (!salesNavUrl || !liAtCookie) return null;
   const profileId = extractFsSalesProfileId(salesNavUrl);
@@ -248,13 +260,12 @@ async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
       signal: AbortSignal.timeout ? AbortSignal.timeout(12000) : undefined,
     });
     if (!resp.ok) {
-      console.warn("resolveSalesNavToPublicUrl non-OK:", resp.status, await safeText(resp));
+      if (RAPIDAPI_DEBUG) console.warn("resolveSalesNavToPublicUrl non-OK:", resp.status, await safeText(resp));
       return null;
     }
     const data = await (async () => { try { return await resp.json(); } catch { return {}; } })();
     const candidates = [
       data?.profile?.profileUrl,
-      data?.profile?.profileUrn,
       data?.publicProfileUrl,
       data?.profile?.publicIdentifier ? `https://www.linkedin.com/in/${data.profile.publicIdentifier}` : null,
     ].filter(Boolean);
@@ -265,222 +276,154 @@ async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
   }
 }
 
-async function safeText(res) { try { return await res.text(); } catch { return ""; } }
+// ---------------- RapidAPI helpers ----------------
+function norm(s){ return (s||"").toString().toLowerCase().trim().replace(/\s+/g," "); }
 
-function derivePublicFromSalesNav(salesNavUrl) {
-  if (!salesNavUrl) return null;
-  const m = salesNavUrl.match(/\/sales\/lead\/([^,\/\?]+)/i);
-  if (m && m[1]) return `https://www.linkedin.com/in/${m[1]}`;
+function looksLikeNameMatch(item, first, last) {
+  const fn = norm(first), ln = norm(last);
+  const name = norm(item?.name || item?.fullName || [item?.firstName, item?.lastName].filter(Boolean).join(" "));
+  if (!fn && !ln) return false;
+  return (fn ? name.includes(fn) : true) && (ln ? name.includes(ln) : true);
+}
+function looksLikeCompanyMatch(item, company) {
+  if (!company) return true;
+  const c = norm(company);
+  const hay = norm(item?.headline || item?.occupation || item?.title || item?.company || item?.experience?.[0]?.companyName);
+  return hay.includes(c) || c.split(" ").some(w => w.length > 3 && hay.includes(w));
+}
+
+function extractPublicUrlFromItem(item) {
+  // common variants across providers
+  const slug =
+    item?.publicIdentifier ||
+    item?.miniProfile?.publicIdentifier ||
+    item?.mini_profile?.public_identifier ||
+    null;
+
+  const direct =
+    item?.publicProfileUrl ||
+    item?.public_profile_url ||
+    item?.profileUrl ||
+    item?.url ||
+    item?.link ||
+    null;
+
+  if (slug && /^[-a-zA-Z0-9_\.%]+$/.test(slug)) {
+    return `https://www.linkedin.com/in/${slug}`;
+  }
+  if (direct && /linkedin\.com\/in\//i.test(direct)) {
+    return direct.startsWith("http") ? direct : `https://${direct}`;
+  }
   return null;
 }
 
-// --- RapidAPI helpers (provider-agnostic, improved) ---
-const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || "";
-const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || "linkedin-data-api.p.rapidapi.com";
-const RAPIDAPI_PROFILE_BY_URL_TMPL = process.env.RAPIDAPI_PROFILE_BY_URL_TMPL || "https://linkedin-data-api.p.rapidapi.com/get-profile-data-by-url?url={url}";
-const RAPIDAPI_SEARCH_TMPL = process.env.RAPIDAPI_SEARCH_TMPL || "https://linkedin-data-api.p.rapidapi.com/search-people?keywords={q}&start=0&count=10";
-const RAPIDAPI_SEARCH_BY_URL_ENDPOINT = process.env.RAPIDAPI_SEARCH_BY_URL_ENDPOINT || ""; // optional POST endpoint
-const RAPIDAPI_TIMEOUT_MS = parseInt(process.env.RAPIDAPI_TIMEOUT_MS || "15000", 10);
-const RAPIDAPI_RETRIES = parseInt(process.env.RAPIDAPI_RETRIES || "1", 10);
-const PUBLIC_URL_STRATEGY = (process.env.PUBLIC_URL_STRATEGY || "rapidapi-first").toLowerCase();
-const DISABLE_INTERNAL_LIAT = (/^(1|true|yes)$/i).test(process.env.DISABLE_INTERNAL_LIAT || "0");
-const RAPIDAPI_DEBUG = (/^(1|true|yes)$/i).test(process.env.RAPIDAPI_DEBUG || "0");
+async function rapidapiFetch(path, { method = "GET", body } = {}) {
+  if (!RAPIDAPI_KEY) return { ok: false, status: 0, error: "No RAPIDAPI_KEY set", json: null, text: "" };
 
-function urlTemplate(tmpl, vars) {
-  return tmpl.replace(/\{(\w+)\}/g, (_, k) => encodeURIComponent(vars[k] ?? ""));
+  const url = `https://${RAPIDAPI_HOST}${path}`;
+  try {
+    const resp = await fetch(url, {
+      method,
+      headers: {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": RAPIDAPI_HOST,
+        ...(body ? { "Content-Type": "application/json" } : {})
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout ? AbortSignal.timeout(RAPIDAPI_TIMEOUT_MS) : undefined
+    });
+
+    const text = await safeText(resp);
+    let json = null;
+    try { json = text ? JSON.parse(text) : null; } catch { /* leave json null */ }
+
+    if (RAPIDAPI_DEBUG) {
+      console.log("[RapidAPI]", method, url, "->", resp.status, text?.slice(0, 400));
+    }
+
+    return { ok: resp.ok, status: resp.status, json, text };
+  } catch (e) {
+    if (RAPIDAPI_DEBUG) console.warn("[RapidAPI] network error", e.message);
+    return { ok: false, status: 0, error: e.message, json: null, text: "" };
+  }
 }
 
-function findFirstLinkedinUrlInString(s) {
-  const m = s.match(/https?:\/\/(?:www\.)?linkedin\.com\/in\/[A-Za-z0-9\-_%\.]+\/?/i);
-  return m ? m[0] : null;
+function buildKeywordQuery(first, last, company) {
+  const parts = [first, last, company].filter(Boolean).join(" ").trim();
+  return encodeURIComponent(parts);
 }
 
-// Deep scan utility: find first string value by key regex
-function findFirstStringByKeyRegex(obj, regex) {
-  const seen = new Set(); const stack = [obj];
-  while (stack.length) {
-    const cur = stack.pop();
-    if (!cur || typeof cur !== "object") continue;
-    if (seen.has(cur)) continue; seen.add(cur);
-    for (const [k, v] of Object.entries(cur)) {
-      if (typeof v === "string") {
-        if (regex.test(k) && v) return v;
-        const direct = findFirstLinkedinUrlInString(v);
-        if (direct) return direct;
-      } else if (v && typeof v === "object") {
-        stack.push(v);
+function buildLinkedInSearchUrl(first, last, company) {
+  const kw = encodeURIComponent([first, last, company].filter(Boolean).join(" ").trim());
+  // Can add currentCompany facet if you know company ID; we're keywording for portability.
+  return `https://www.linkedin.com/search/results/people/?keywords=${kw}&origin=FACETED_SEARCH`;
+}
+
+// GET /search-people
+async function rapidapiSearchPeople(keywords) {
+  const params = new URLSearchParams({ keywords, start: "0" });
+  if (RAPIDAPI_GEO) params.set("geo", RAPIDAPI_GEO);
+  // Some vendors ignore unknown params, but avoid 'count' unless documented
+  return rapidapiFetch(`/search-people?${params.toString()}`, { method: "GET" });
+}
+
+// POST /search-people-by-url
+async function rapidapiSearchPeopleByUrl(searchUrl) {
+  return rapidapiFetch(`/search-people-by-url`, {
+    method: "POST",
+    body: { url: searchUrl }
+  });
+}
+
+function flattenCandidates(json) {
+  if (!json) return [];
+  const a = [];
+  // Common shapes seen across RapidAPI “LinkedIn” providers
+  const roots = [
+    json.data, json.results, json.list, json.items, json.profiles, json.people, json
+  ].filter(Boolean);
+  for (const r of roots) {
+    if (Array.isArray(r)) a.push(...r);
+    else if (Array.isArray(r?.data)) a.push(...r.data);
+    else if (Array.isArray(r?.results)) a.push(...r.results);
+  }
+  return a;
+}
+
+async function rapidapiFindPublicUrlByName({ first, last, company }) {
+  if (!RAPIDAPI_KEY) return null;
+
+  const keywords = buildKeywordQuery(first, last, company);
+  // 1) Try search-people (with optional geo)
+  const r1 = await rapidapiSearchPeople(keywords);
+  if (r1.ok) {
+    const items = flattenCandidates(r1.json);
+    for (const it of items) {
+      const url = extractPublicUrlFromItem(it);
+      if (url && looksLikeNameMatch(it, first, last) && looksLikeCompanyMatch(it, company)) {
+        return url;
       }
     }
   }
-  return null;
-}
 
-function rapidapiExtractPublicUrlFromSearch(payload) {
-  if (!payload) return null;
-
-  // 1) If payload is a string, try direct match
-  if (typeof payload === "string") {
-    const direct = findFirstLinkedinUrlInString(payload);
-    if (direct) return direct;
-  }
-
-  // 2) Try common arrays
-  const arrays = [];
-  if (Array.isArray(payload)) arrays.push(payload);
-  if (Array.isArray(payload.results)) arrays.push(payload.results);
-  if (Array.isArray(payload.items)) arrays.push(payload.items);
-  if (payload.data && Array.isArray(payload.data)) arrays.push(payload.data);
-
-  for (const arr of arrays) {
-    for (const it of arr) {
-      if (!it || typeof it !== "object") continue;
-      // direct url fields
-      for (const key of ["public_profile_url","profile_url","url","link","publicProfileUrl","profileUrl"]) {
-        const v = it[key];
-        if (typeof v === "string" && v.includes("linkedin.com/in/")) return v;
-      }
-      // nested profile
-      if (it.profile && typeof it.profile === "object") {
-        const cand = it.profile.publicProfileUrl || it.profile.profileUrl || it.profile.url;
-        if (typeof cand === "string" && cand.includes("linkedin.com/in/")) return cand;
-      }
-      // identifier slugs
-      const slug =
-        it.publicIdentifier || it.public_id || it.publicId ||
-        (it.profile && (it.profile.publicIdentifier || it.profile.public_id || it.profile.publicId));
-      if (typeof slug === "string" && slug) {
-        return `https://www.linkedin.com/in/${slug.replace(/^in\//, "").replace(/^https?:\/\//, "")}`;
-      }
-      // fallback: any string value with /in/
-      for (const v of Object.values(it)) {
-        if (typeof v === "string") {
-          const direct = findFirstLinkedinUrlInString(v);
-          if (direct) return direct;
-        }
+  // 2) Fall back: craft LinkedIn search URL and POST /search-people-by-url
+  const liSearch = buildLinkedInSearchUrl(first, last, company);
+  const r2 = await rapidapiSearchPeopleByUrl(liSearch);
+  if (r2.ok) {
+    const items = flattenCandidates(r2.json);
+    for (const it of items) {
+      const url = extractPublicUrlFromItem(it);
+      if (url && looksLikeNameMatch(it, first, last) && looksLikeCompanyMatch(it, company)) {
+        return url;
       }
     }
   }
 
-  // 3) Deep key search for *identifier* fields or any /in/ url
-  const deep = findFirstStringByKeyRegex(payload, /public.?identifier|public[_-]?id/i);
-  if (deep) {
-    return deep.includes("linkedin.com/in/")
-      ? deep
-      : `https://www.linkedin.com/in/${deep.replace(/^in\//, "")}`;
-  }
-
-  // 4) Final hail-mary: stringify and regex
-  const asStr = JSON.stringify(payload);
-  const direct = findFirstLinkedinUrlInString(asStr);
-  if (direct) return direct;
-
+  // 3) Nothing found
   return null;
 }
 
-async function rapidFetch(url, { method = "GET", bodyObj } = {}) {
-  if (!RAPIDAPI_KEY || !RAPIDAPI_HOST) throw new Error("RapidAPI not configured");
-  const headers = {
-    "x-rapidapi-key": RAPIDAPI_KEY,
-    "x-rapidapi-host": RAPIDAPI_HOST,
-    "accept": "application/json"
-  };
-  if (method === "POST") headers["content-type"] = "application/json";
-
-  const resp = await fetch(url, {
-    method,
-    headers,
-    body: method === "POST" ? JSON.stringify(bodyObj || {}) : undefined,
-    signal: AbortSignal.timeout ? AbortSignal.timeout(RAPIDAPI_TIMEOUT_MS) : undefined
-  });
-
-  const txt = await safeText(resp);
-  let data = null; try { data = txt ? JSON.parse(txt) : null; } catch {} // ignore parse errors
-
-  if (RAPIDAPI_DEBUG) {
-    console.log("[RapidAPI]", method, url);
-    console.log("[RapidAPI] status", resp.status);
-    console.log("[RapidAPI] body", (txt || "").slice(0, 2000));
-  }
-
-  return { ok: resp.ok, status: resp.status, data, raw: txt };
-}
-
-function buildPeopleQuery({ first, last, company, title }) {
-  return [first, last, company, title].filter(Boolean).join(" ").trim();
-}
-
-async function rapidapiFindPublicUrlByName({ first, last, company, title }) {
-  const q = buildPeopleQuery({ first, last, company, title });
-  if (!q) return null;
-  const url = urlTemplate(RAPIDAPI_SEARCH_TMPL, { q });
-  let found = null;
-  for (let i = 0; i <= RAPIDAPI_RETRIES; i++) {
-    try {
-      const r = await rapidFetch(url, { method: "GET" });
-      if (r.ok) {
-        found = rapidapiExtractPublicUrlFromSearch(r.data || r.raw);
-        if (found) return found;
-      }
-    } catch {}
-  }
-  return null;
-}
-
-async function rapidapiSearchByLinkedinUrlFallback({ first, last, company, title }) {
-  if (!RAPIDAPI_SEARCH_BY_URL_ENDPOINT) return null;
-  const q = buildPeopleQuery({ first, last, company, title });
-  if (!q) return null;
-  const searchUrl = `https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(q)}&origin=FACETED_SEARCH`;
-  for (let i = 0; i <= RAPIDAPI_RETRIES; i++) {
-    try {
-      const r = await rapidFetch(RAPIDAPI_SEARCH_BY_URL_ENDPOINT, { method: "POST", bodyObj: { url: searchUrl } });
-      if (r.ok) {
-        const found = rapidapiExtractPublicUrlFromSearch(r.data || r.raw);
-        if (found) return found;
-      }
-    } catch {}
-  }
-  return null;
-}
-
-async function rapidapiGetProfileByUrl(urlToTry) {
-  if (!RAPIDAPI_PROFILE_BY_URL_TMPL || !urlToTry) return null;
-  const url = urlTemplate(RAPIDAPI_PROFILE_BY_URL_TMPL, { url: urlToTry });
-  for (let i = 0; i <= RAPIDAPI_RETRIES; i++) {
-    try {
-      const r = await rapidFetch(url, { method: "GET" });
-      if (r.ok) {
-        const found = rapidapiExtractPublicUrlFromSearch(r.data || r.raw);
-        if (found) return found;
-      }
-    } catch {}
-  }
-  return null;
-}
-
-async function resolvePublicViaRapidApi({ salesNavUrl, firstName, lastName, company, title }) {
-  // 1) Some providers accept Sales Nav directly in "get-profile-data-by-url"
-  if (salesNavUrl) {
-    const direct = await rapidapiGetProfileByUrl(salesNavUrl);
-    if (direct) return direct;
-  }
-
-  // 2) POST search-by-URL fallback (build a LinkedIn people search URL with keywords)
-  const byUrl = await rapidapiSearchByLinkedinUrlFallback({
-    first: firstName, last: lastName, company, title
-  });
-  if (byUrl) return byUrl;
-
-  // 3) Keyword search
-  const byName = await rapidapiFindPublicUrlByName({
-    first: firstName, last: lastName, company, title
-  });
-  if (byName) return byName;
-
-  return null;
-}
-
-// --- Auth Middleware ---
+// ---------------- Auth Middleware ----------------
 function authenticateToken(req, res, next) {
   const auth = req.headers["authorization"];
   const token = auth && auth.split(" ")[1];
@@ -492,7 +435,7 @@ function authenticateToken(req, res, next) {
   });
 }
 
-// --- Auth Endpoints ---
+// ---------------- Auth Endpoints ----------------
 app.post("/register", async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ success: false, message: "Email and password are required." });
@@ -523,7 +466,7 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// --- Job Queue Endpoints ---
+// ---------------- Job Queue Endpoints ----------------
 app.post("/jobs", async (req, res) => {
   try {
     const { type, payload, priority = 5 } = req.body || {};
@@ -645,7 +588,7 @@ app.get("/jobs/stats", async (_req, res) => {
   res.json({ counts: { queued: d.queued.length, active: d.active.length, done: d.done.length, failed: d.failed.length } });
 });
 
-// --- Cookies from extension ---
+// ---------------- Cookies from extension ----------------
 app.post("/store-cookies", (req, res) => {
   try {
     const body = req.body || {};
@@ -684,6 +627,7 @@ app.get("/api/me/liat", authenticateToken, (req, res) => {
   }
 });
 
+// ---------------- Messaging/Connection jobs ----------------
 app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
@@ -723,7 +667,6 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
   }
 });
 
-// 🆕 NEW: enqueue message job (1st-degree messaging flow)
 app.post("/jobs/enqueue-send-message", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
@@ -746,7 +689,7 @@ app.post("/jobs/enqueue-send-message", authenticateToken, async (req, res) => {
         userId: email,
         profileUrl,
         message,
-        cookieBundle // optional; worker also supports creds+totp auth path
+        cookieBundle
       },
       priority,
       status: "queued",
@@ -764,7 +707,7 @@ app.post("/jobs/enqueue-send-message", authenticateToken, async (req, res) => {
   }
 });
 
-// --- Leads upload ---
+// ---------------- Leads upload (now with RapidAPI enrichment) ----------------
 app.post("/upload-leads", async (req, res) => {
   if (process.env.LOG_UPLOADS === "true") console.log("Received /upload-leads");
   const { leads, timestamp } = req.body || {};
@@ -774,7 +717,7 @@ app.post("/upload-leads", async (req, res) => {
   }
 
   const liAt = getLatestLiAtForUser(userEmail);
-  if (!liAt) console.warn("[upload-leads] No li_at stored for", userEmail, "- RapidAPI will handle resolution; legacy fallbacks limited.");
+  if (!liAt) console.warn("[upload-leads] No li_at stored for", userEmail, "- will rely on RapidAPI/fallbacks.");
 
   const insertLeadSql = `
     INSERT OR IGNORE INTO leads
@@ -794,7 +737,7 @@ app.post("/upload-leads", async (req, res) => {
     try {
       const firstName = rawLead.first_name || null;
       const lastName  = rawLead.last_name || null;
-      const organization = rawLead.company || null;
+      const organization = rawLead.company || rawLead.organization || null;
       const title = rawLead.title || null;
 
       let publicUrl = (rawLead.public_linkedin_url && rawLead.public_linkedin_url !== "N/A")
@@ -808,37 +751,38 @@ app.post("/upload-leads", async (req, res) => {
 
       const profileUrlLegacy = rawLead.profile_url || null;
 
-      // --- NEW ORDER: RapidAPI first, then optional li_at fallback, then heuristic
-      if (!publicUrl) {
-        const wantRapidFirst = PUBLIC_URL_STRATEGY === "rapidapi-first";
+      // Resolution order controlled by RAPIDAPI_STRATEGY
+      const tryRapidFirst = RAPIDAPI_STRATEGY === "rapidapi-first";
 
-        async function tryRapid() {
-          return await resolvePublicViaRapidApi({
-            salesNavUrl, firstName, lastName, company: organization, title
+      async function tryRapid() {
+        if (!publicUrl) {
+          publicUrl = await rapidapiFindPublicUrlByName({
+            first: firstName,
+            last: lastName,
+            company: organization
           });
         }
-
-        if (wantRapidFirst) {
-          publicUrl = await tryRapid();
-          if (!DISABLE_INTERNAL_LIAT && !publicUrl && salesNavUrl && liAt) {
-            publicUrl = await resolveSalesNavToPublicUrl(salesNavUrl, liAt);
-          }
-        } else {
-          if (!DISABLE_INTERNAL_LIAT && salesNavUrl && liAt) {
-            publicUrl = await resolveSalesNavToPublicUrl(salesNavUrl, liAt);
-          }
-          if (!publicUrl) publicUrl = await tryRapid();
+      }
+      async function tryCookies() {
+        if (!publicUrl && salesNavUrl && liAt) {
+          publicUrl = await resolveSalesNavToPublicUrl(salesNavUrl, liAt);
         }
-
         if (!publicUrl && salesNavUrl && salesNavUrl.includes("/sales/lead/")) {
-          const inferredPublic = derivePublicFromSalesNav(salesNavUrl);
-          if (inferredPublic) publicUrl = inferredPublic;
+          publicUrl = derivePublicFromSalesNav(salesNavUrl);
         }
       }
-      // --- END NEW ORDER ---
+
+      if (tryRapidFirst) {
+        await tryRapid();
+        await tryCookies();
+      } else {
+        await tryCookies();
+        await tryRapid();
+      }
 
       const public_profile_url_to_store = publicUrl || null;
 
+      // Require at least one URL to store (public, legacy, or sales nav)
       if (!public_profile_url_to_store && !profileUrlLegacy && !salesNavUrl) { skipped++; return; }
 
       const info = insertStmt.run(
@@ -846,7 +790,8 @@ app.post("/upload-leads", async (req, res) => {
         organization, title, timestamp || new Date().toISOString(), "scraped"
       );
       if (info.changes > 0) inserted++; else skipped++;
-    } catch {
+    } catch (e) {
+      if (RAPIDAPI_DEBUG) console.warn("[upload-leads] processOne error", e.message);
       skipped++;
     }
   }
@@ -871,7 +816,7 @@ app.post("/upload-leads", async (req, res) => {
   });
 });
 
-// --- Leads / Excel / Automation ---
+// ---------------- Leads / Excel / Automation ----------------
 app.get("/api/leads", authenticateToken, (req, res) => {
   try {
     const rows = db.prepare("SELECT * FROM leads WHERE user_email = ? ORDER BY scraped_at DESC").all(req.user.email);
@@ -1031,7 +976,7 @@ app.post("/api/automation/update-status", authenticateToken, (req, res) => {
   }
 });
 
-// --- Connection status & logs ---
+// ---------------- Connection status & logs ----------------
 const LIVE_CHECK_COOLDOWN_MS = 10 * 60 * 1000;
 
 app.get("/api/connection/check", authenticateToken, async (req, res) => {
@@ -1147,7 +1092,7 @@ app.get("/api/connection/logs", authenticateToken, (req, res) => {
   }
 });
 
-// --- Connect flow endpoints (UI -> backend) ---
+// ---------------- Connect flow endpoints ----------------
 app.post("/api/connect/start", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
@@ -1214,8 +1159,7 @@ app.post("/api/connect/test", authenticateToken, async (req, res) => {
   }
 });
 
-// --- NEW: Account settings (Sprouts-mode) ---
-// Save LinkedIn creds
+// ---------------- Account settings (Sprouts-mode) ----------------
 app.post("/api/account/creds", authenticateToken, (req, res) => {
   const email = req.user.email;
   const { username, password } = req.body || {};
@@ -1233,7 +1177,6 @@ app.post("/api/account/creds", authenticateToken, (req, res) => {
   res.json({ ok: true });
 });
 
-// Save TOTP secret
 app.post("/api/account/totp", authenticateToken, (req, res) => {
   const email = req.user.email;
   const { totpSecret } = req.body || {};
@@ -1250,7 +1193,6 @@ app.post("/api/account/totp", authenticateToken, (req, res) => {
   res.json({ ok: true });
 });
 
-// Save proxy
 app.post("/api/account/proxy", authenticateToken, (req, res) => {
   const email = req.user.email;
   const { server, username, password } = req.body || {};
@@ -1267,7 +1209,6 @@ app.post("/api/account/proxy", authenticateToken, (req, res) => {
   res.json({ ok: true });
 });
 
-// Masked read for UI
 app.get("/api/account/settings", authenticateToken, (req, res) => {
   const email = req.user.email;
   const row = db.prepare("SELECT * FROM account_settings WHERE email = ?").get(email) || {};
@@ -1287,7 +1228,6 @@ app.get("/api/account/settings", authenticateToken, (req, res) => {
   });
 });
 
-// Worker read (decrypted)
 app.get("/worker/account/settings", requireWorkerAuth, (req, res) => {
   const userId = req.query.userId;
   if (!userId) return res.status(400).json({ ok: false, error: "userId required" });
@@ -1308,26 +1248,60 @@ app.get("/worker/account/settings", requireWorkerAuth, (req, res) => {
   });
 });
 
-// --- Dev: RapidAPI sanity check ---
+// ---------------- Dev endpoints (for debugging RapidAPI) ----------------
 app.get("/api/dev/rapidapi-test", async (req, res) => {
-  const salesNavUrl = req.query.url || "";
   const first = req.query.first || "";
   const last = req.query.last || "";
   const company = req.query.company || "";
-  const title = req.query.title || "";
-  try {
-    // Try both: name search & (if provided) direct URL
-    let found = await rapidapiFindPublicUrlByName({ first, last, company, title });
-    if (!found && salesNavUrl) {
-      found = await resolvePublicViaRapidApi({ salesNavUrl, firstName: first, lastName: last, company, title });
-    }
-    res.json({ ok: true, found, provider: process.env.RAPIDAPI_HOST, strategy: process.env.PUBLIC_URL_STRATEGY });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+  const debug = req.query.debug === "1";
+
+  let found = null;
+  let steps = [];
+
+  if (!RAPIDAPI_KEY) {
+    return res.json({ ok: false, error: "RAPIDAPI_KEY not set on server" });
   }
+
+  // Step 1: search-people
+  const kw = buildKeywordQuery(first, last, company);
+  const r1 = await rapidapiSearchPeople(kw);
+  steps.push({ step: "search-people", status: r1.status, ok: r1.ok, sample: debug ? (r1.text || "").slice(0, 800) : undefined });
+  if (r1.ok) {
+    const items = flattenCandidates(r1.json);
+    for (const it of items) {
+      const url = extractPublicUrlFromItem(it);
+      if (url && looksLikeNameMatch(it, first, last) && looksLikeCompanyMatch(it, company)) {
+        found = url; break;
+      }
+    }
+  }
+
+  // Step 2: search-people-by-url
+  if (!found) {
+    const liSearch = buildLinkedInSearchUrl(first, last, company);
+    const r2 = await rapidapiSearchPeopleByUrl(liSearch);
+    steps.push({ step: "search-people-by-url", status: r2.status, ok: r2.ok, sample: debug ? (r2.text || "").slice(0, 800) : undefined, liSearch });
+    if (r2.ok) {
+      const items = flattenCandidates(r2.json);
+      for (const it of items) {
+        const url = extractPublicUrlFromItem(it);
+        if (url && looksLikeNameMatch(it, first, last) && looksLikeCompanyMatch(it, company)) {
+          found = url; break;
+        }
+      }
+    }
+  }
+
+  return res.json({
+    ok: true,
+    found,
+    provider: RAPIDAPI_HOST,
+    strategy: RAPIDAPI_STRATEGY,
+    steps
+  });
 });
 
-// --- Root (Dashboard) ---
+// ---------------- Root (Dashboard) ----------------
 app.get("/", (req, res) => {
   const file = path.join(__dirname, "public", "dashboard.html");
   fs.pathExists(file).then(exists => {
@@ -1336,7 +1310,13 @@ app.get("/", (req, res) => {
   });
 });
 
-// --- Start ---
+// ---------------- Start ----------------
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server is running on port ${PORT}`);
+  if (!RAPIDAPI_KEY) {
+    console.log("NOTE: RAPIDAPI_KEY not set – RapidAPI enrichment is disabled.");
+  } else {
+    console.log(`RapidAPI host: ${RAPIDAPI_HOST} | strategy: ${RAPIDAPI_STRATEGY} | geo: ${RAPIDAPI_GEO || "(none)"}`);
+    if (RAPIDAPI_DEBUG) console.log("RapidAPI debug logging is ON");
+  }
 });
