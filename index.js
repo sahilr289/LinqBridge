@@ -517,6 +517,47 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
   }
 });
 
+// 🆕 NEW: enqueue message job (1st-degree messaging flow)
+app.post("/jobs/enqueue-send-message", authenticateToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+    const { profileUrl, message, priority = 3 } = req.body || {};
+    if (!profileUrl) return res.status(400).json({ error: "profileUrl required" });
+    if (!message)   return res.status(400).json({ error: "message required" });
+
+    const row = db.prepare(
+      "SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1"
+    ).get(email);
+
+    const cookieBundle = row?.li_at ? { li_at: row.li_at, jsessionid: row.jsessionid || null, bcookie: row.bcookie || null } : null;
+
+    const d = await readJobs();
+    const job = {
+      id: uuidv4(),
+      type: "SEND_MESSAGE",
+      payload: {
+        tenantId: "default",
+        userId: email,
+        profileUrl,
+        message,
+        cookieBundle // optional; worker also supports creds+totp auth path
+      },
+      priority,
+      status: "queued",
+      enqueuedAt: new Date().toISOString(),
+      attempts: 0,
+      lastError: null,
+    };
+    d.queued.push(job);
+    d.queued.sort((a, b) => a.priority - b.priority);
+    await writeJobs(d);
+    res.json({ ok: true, job });
+  } catch (e) {
+    console.error("enqueue-send-message error:", e);
+    res.status(500).json({ error: "Failed to enqueue" });
+  }
+});
+
 // --- Leads upload ---
 app.post("/upload-leads", async (req, res) => {
   if (process.env.LOG_UPLOADS === "true") console.log("Received /upload-leads");
