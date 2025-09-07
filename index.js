@@ -1,4 +1,4 @@
-// index.js — LinqBridge backend (FINAL with "Sprouts-mode": creds+TOTP+proxy storage, worker fetch)
+// index.js — LinqBridge backend (FINAL with RapidAPI public URL resolution + "Sprouts-mode": creds+TOTP+proxy storage, worker fetch)
 
 const express = require("express");
 const cors = require("cors");
@@ -271,6 +271,139 @@ function derivePublicFromSalesNav(salesNavUrl) {
   if (!salesNavUrl) return null;
   const m = salesNavUrl.match(/\/sales\/lead\/([^,\/\?]+)/i);
   if (m && m[1]) return `https://www.linkedin.com/in/${m[1]}`;
+  return null;
+}
+
+// --- RapidAPI helpers (provider-agnostic) ---
+const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || "";
+const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || "";
+const RAPIDAPI_PROFILE_BY_URL_TMPL = process.env.RAPIDAPI_PROFILE_BY_URL_TMPL || "";
+const RAPIDAPI_SEARCH_TMPL = process.env.RAPIDAPI_SEARCH_TMPL || "";
+const RAPIDAPI_SEARCH_BY_URL_ENDPOINT = process.env.RAPIDAPI_SEARCH_BY_URL_ENDPOINT || ""; // optional POST endpoint
+const RAPIDAPI_TIMEOUT_MS = parseInt(process.env.RAPIDAPI_TIMEOUT_MS || "12000", 10);
+const RAPIDAPI_RETRIES = parseInt(process.env.RAPIDAPI_RETRIES || "1", 10);
+const PUBLIC_URL_STRATEGY = (process.env.PUBLIC_URL_STRATEGY || "rapidapi-first").toLowerCase();
+const DISABLE_INTERNAL_LIAT = (/^(1|true|yes)$/i).test(process.env.DISABLE_INTERNAL_LIAT || "0");
+
+function urlTemplate(tmpl, vars) {
+  return tmpl.replace(/\{(\w+)\}/g, (_, k) => encodeURIComponent(vars[k] ?? ""));
+}
+
+function extractFirstLinkedinUrlFromJson(any) {
+  const seen = new Set(); const stack = [any];
+  while (stack.length) {
+    const v = stack.pop();
+    if (v == null || typeof v === "number" || typeof v === "boolean") continue;
+    if (typeof v === "string") {
+      const m = v.match(/https?:\/\/(www\.)?linkedin\.com\/in\/[A-Za-z0-9\-_%./]+/i);
+      if (m) return m[0];
+      continue;
+    }
+    if (typeof v === "object") {
+      if (seen.has(v)) continue; seen.add(v);
+      for (const k of Object.keys(v)) {
+        const val = v[k];
+        if (typeof val === "string") {
+          const m = val.match(/https?:\/\/(www\.)?linkedin\.com\/in\/[A-Za-z0-9\-_%./]+/i);
+          if (m) return m[0];
+          if (k.toLowerCase().includes("public") && k.toLowerCase().includes("identifier")) {
+            if (/^[A-Za-z0-9\-_%]+$/.test(val)) return `https://www.linkedin.com/in/${val}`;
+          }
+        }
+      }
+      for (const k of Object.keys(v)) stack.push(v[k]);
+    }
+  }
+  return null;
+}
+
+async function rapidGet(fullUrl) {
+  if (!RAPIDAPI_KEY || !RAPIDAPI_HOST) throw new Error("RapidAPI not configured");
+  const ctrl = AbortSignal.timeout ? AbortSignal.timeout(RAPIDAPI_TIMEOUT_MS) : undefined;
+  const res = await fetch(fullUrl, {
+    method: "GET",
+    headers: {
+      "x-rapidapi-key": RAPIDAPI_KEY,
+      "x-rapidapi-host": RAPIDAPI_HOST,
+      "accept": "application/json"
+    },
+    signal: ctrl
+  });
+  const txt = await safeText(res);
+  let json = null; try { json = JSON.parse(txt); } catch {}
+  return { ok: res.ok, status: res.status, json, txt };
+}
+
+async function rapidPostJson(fullUrl, bodyObj) {
+  if (!RAPIDAPI_KEY || !RAPIDAPI_HOST) throw new Error("RapidAPI not configured");
+  const ctrl = AbortSignal.timeout ? AbortSignal.timeout(RAPIDAPI_TIMEOUT_MS) : undefined;
+  const res = await fetch(fullUrl, {
+    method: "POST",
+    headers: {
+      "x-rapidapi-key": RAPIDAPI_KEY,
+      "x-rapidapi-host": RAPIDAPI_HOST,
+      "accept": "application/json",
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(bodyObj),
+    signal: ctrl
+  });
+  const txt = await safeText(res);
+  let json = null; try { json = JSON.parse(txt); } catch {}
+  return { ok: res.ok, status: res.status, json, txt };
+}
+
+/**
+ * Resolve public linkedin.com/in/... via RapidAPI.
+ * 1) Try provider's "profile-by-url" with the given URL (some providers require public URL; may fail for Sales Nav).
+ * 2) Optional: try provider's POST search-by-url (if configured).
+ * 3) Fallback to keywords search "first last company".
+ */
+async function resolvePublicViaRapidApi({ salesNavUrl, firstName, lastName, company }) {
+  if (!RAPIDAPI_KEY || !RAPIDAPI_HOST) return null;
+
+  // 1) Try GET by URL (works if the URL is a public profile; some providers accept Sales Nav too)
+  if (RAPIDAPI_PROFILE_BY_URL_TMPL && salesNavUrl) {
+    for (let attempt = 0; attempt <= RAPIDAPI_RETRIES; attempt++) {
+      try {
+        const u = urlTemplate(RAPIDAPI_PROFILE_BY_URL_TMPL, { url: salesNavUrl });
+        const r = await rapidGet(u);
+        if (r.ok) {
+          const found = extractFirstLinkedinUrlFromJson(r.json ?? r.txt);
+          if (found) return found;
+        }
+      } catch {}
+    }
+  }
+
+  // 2) Optional POST "search-people-by-url" with the Sales/People search URL
+  if (RAPIDAPI_SEARCH_BY_URL_ENDPOINT && salesNavUrl) {
+    for (let attempt = 0; attempt <= RAPIDAPI_RETRIES; attempt++) {
+      try {
+        const r = await rapidPostJson(RAPIDAPI_SEARCH_BY_URL_ENDPOINT, { url: salesNavUrl });
+        if (r.ok) {
+          const found = extractFirstLinkedinUrlFromJson(r.json ?? r.txt);
+          if (found) return found;
+        }
+      } catch {}
+    }
+  }
+
+  // 3) Keywords search
+  const q = [firstName, lastName, company].filter(Boolean).join(" ").trim();
+  if (RAPIDAPI_SEARCH_TMPL && q) {
+    for (let attempt = 0; attempt <= RAPIDAPI_RETRIES; attempt++) {
+      try {
+        const u = urlTemplate(RAPIDAPI_SEARCH_TMPL, { q });
+        const r = await rapidGet(u);
+        if (r.ok) {
+          const found = extractFirstLinkedinUrlFromJson(r.json ?? r.txt);
+          if (found) return found;
+        }
+      } catch {}
+    }
+  }
+
   return null;
 }
 
@@ -568,7 +701,7 @@ app.post("/upload-leads", async (req, res) => {
   }
 
   const liAt = getLatestLiAtForUser(userEmail);
-  if (!liAt) console.warn("[upload-leads] No li_at stored for", userEmail, "- will save Sales Nav URLs as-is.");
+  if (!liAt) console.warn("[upload-leads] No li_at stored for", userEmail, "- RapidAPI will handle resolution; legacy fallbacks limited.");
 
   const insertLeadSql = `
     INSERT OR IGNORE INTO leads
@@ -602,15 +735,34 @@ app.post("/upload-leads", async (req, res) => {
 
       const profileUrlLegacy = rawLead.profile_url || null;
 
-      if (!publicUrl && salesNavUrl && liAt) {
-        publicUrl = await resolveSalesNavToPublicUrl(salesNavUrl, liAt);
-      }
-      let inferredPublic = null;
-      if (!publicUrl && salesNavUrl && salesNavUrl.includes("/sales/lead/")) {
-        inferredPublic = derivePublicFromSalesNav(salesNavUrl);
-      }
+      // --- NEW ORDER: RapidAPI first, then optional li_at fallback, then heuristic
+      if (!publicUrl) {
+        const wantRapidFirst = PUBLIC_URL_STRATEGY === "rapidapi-first";
+        const tryRapid = async () => await resolvePublicViaRapidApi({
+          salesNavUrl, firstName, lastName, company: organization
+        });
 
-      const public_profile_url_to_store = publicUrl || inferredPublic || null;
+        if (wantRapidFirst) {
+          publicUrl = await tryRapid();
+
+          if (!DISABLE_INTERNAL_LIAT && !publicUrl && salesNavUrl && liAt) {
+            publicUrl = await resolveSalesNavToPublicUrl(salesNavUrl, liAt);
+          }
+        } else {
+          if (!DISABLE_INTERNAL_LIAT && salesNavUrl && liAt) {
+            publicUrl = await resolveSalesNavToPublicUrl(salesNavUrl, liAt);
+          }
+          if (!publicUrl) publicUrl = await tryRapid();
+        }
+
+        if (!publicUrl && salesNavUrl && salesNavUrl.includes("/sales/lead/")) {
+          const inferredPublic = derivePublicFromSalesNav(salesNavUrl);
+          if (inferredPublic) publicUrl = inferredPublic;
+        }
+      }
+      // --- END NEW ORDER ---
+
+      const public_profile_url_to_store = publicUrl || null;
 
       if (!public_profile_url_to_store && !profileUrlLegacy && !salesNavUrl) { skipped++; return; }
 
@@ -1079,6 +1231,20 @@ app.get("/worker/account/settings", requireWorkerAuth, (req, res) => {
       }
     }
   });
+});
+
+// --- Dev: RapidAPI sanity check ---
+app.get("/api/dev/rapidapi-test", async (req, res) => {
+  const salesNavUrl = req.query.url || "";
+  const first = req.query.first || "";
+  const last = req.query.last || "";
+  const company = req.query.company || "";
+  try {
+    const found = await resolvePublicViaRapidApi({ salesNavUrl, firstName: first, lastName: last, company });
+    res.json({ ok: true, found, provider: process.env.RAPIDAPI_HOST, strategy: process.env.PUBLIC_URL_STRATEGY });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // --- Root (Dashboard) ---
