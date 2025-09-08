@@ -1,5 +1,5 @@
 // index.js — LinqBridge backend (FINAL with "Sprouts-mode": creds+TOTP+proxy storage, worker fetch)
-// + Public URL resolution via Proxycurl (primary) and SerpAPI (fallback)
+// + Public URL resolution via SerpAPI (primary), then cookies-based SalesNav, then naive inference.
 
 const express = require("express");
 const cors = require("cors");
@@ -19,8 +19,7 @@ const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key_change_this_for_prod";
 const ENC_SECRET = process.env.ENC_SECRET || "change_me_32+chars_in_prod";
 
-// --- 3P API Keys ---
-const PROXYCURL_API_KEY = process.env.PROXYCURL_API_KEY || ""; // https://nubela.co
+// --- External API keys (SerpAPI only) ---
 const SERPAPI_KEY = process.env.SERPAPI_KEY || ""; // https://serpapi.com
 
 // --- Optional viewer info for Connect flow ---
@@ -208,18 +207,7 @@ function dec(blob) {
   return decd.toString("utf8");
 }
 
-// --- Small helpers used by resolvers ---
-async function safeText(res) { try { return await res.text(); } catch { return ""; } }
-function isLikelyDomain(s = "") { return !!s && /\./.test(s) && !/\s/.test(s); }
-function cleanCompanyToDomainGuess(name = "") {
-  // VERY naive guess: "Amazon" -> "amazon.com"
-  const core = (name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-  return core ? `${core}.com` : null;
-}
-function isLinkedInPublicUrl(u = "") { return typeof u === "string" && /linkedin\.com\/in\//i.test(u); }
-function norm(u) { try { return new URL(u).toString(); } catch { return u; } }
-
-// --- LinkedIn cookie helpers (your existing ones) ---
+// --- Helpers ---
 function logConn(email, level, event, detailsObj) {
   try {
     db.prepare(`
@@ -230,6 +218,7 @@ function logConn(email, level, event, detailsObj) {
     console.warn("logConn error:", e.message);
   }
 }
+
 function getLatestLiAtForUser(email) {
   try {
     const row = db.prepare("SELECT li_at FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1").get(email);
@@ -239,10 +228,12 @@ function getLatestLiAtForUser(email) {
     return null;
   }
 }
+
 function extractFsSalesProfileId(salesNavUrl = "") {
   const m = salesNavUrl.match(/fs_salesProfile:(\d+)/) || salesNavUrl.match(/fs_salesProfile:\((\d+)\)/);
   return m ? m[1] : null;
 }
+
 async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
   if (!salesNavUrl || !liAtCookie) return null;
   const profileId = extractFsSalesProfileId(salesNavUrl);
@@ -271,12 +262,16 @@ async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
       data?.publicProfileUrl,
       data?.profile?.publicIdentifier ? `https://www.linkedin.com/in/${data.profile.publicIdentifier}` : null,
     ].filter(Boolean);
-    return candidates.find(isLinkedInPublicUrl) || candidates[0] || null;
+    const first = candidates[0] || null;
+    return first;
   } catch (e) {
     console.error("resolveSalesNavToPublicUrl error:", e);
     return null;
   }
 }
+
+async function safeText(res) { try { return await res.text(); } catch { return ""; } }
+
 function derivePublicFromSalesNav(salesNavUrl) {
   if (!salesNavUrl) return null;
   const m = salesNavUrl.match(/\/sales\/lead\/([^,\/\?]+)/i);
@@ -284,77 +279,9 @@ function derivePublicFromSalesNav(salesNavUrl) {
   return null;
 }
 
-// ---------- New: Public URL resolvers (Proxycurl + SerpAPI) ----------
-async function proxycurlPersonLookup({ firstName, lastName, company, title = null, location = null }) {
-  if (!PROXYCURL_API_KEY) return { url: null, step: "proxycurl-skip-no-key" };
-
-  // Person Lookup works best with company domain. If company looks like a domain, use it.
-  let companyDomain = null;
-  if (isLikelyDomain(company)) {
-    companyDomain = company.trim().toLowerCase();
-  } else {
-    // Optional: you can try to resolve the domain via Company Lookup (costs 2 credits)
-    // For now, as a light heuristic, guess "name.com". Uncomment below to spend credits:
-    // companyDomain = await proxycurlResolveCompanyDomain(company);
-    companyDomain = cleanCompanyToDomainGuess(company); // heuristic only
-  }
-
-  if (!companyDomain) return { url: null, step: "proxycurl-no-domain" };
-
-  const endpoint = "https://nubela.co/proxycurl/api/professionalsocmed/profile/resolve"; // Person Lookup
-  const params = new URLSearchParams();
-  if (firstName) params.set("first_name", firstName);
-  if (lastName)  params.set("last_name", lastName);
-  params.set("company_domain", companyDomain);
-  if (title)     params.set("title", title);
-  if (location)  params.set("location", location);
-  // params.set("similarity_checks","skip"); // optionally narrow behavior
-
-  try {
-    const resp = await fetch(`${endpoint}?${params.toString()}`, {
-      method: "GET",
-      headers: { "Authorization": `Bearer ${PROXYCURL_API_KEY}` },
-      signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
-    });
-    const text = await safeText(resp);
-    if (!resp.ok) {
-      console.warn("[proxycurl] HTTP", resp.status, text?.slice(0, 200));
-      return { url: null, step: `proxycurl-http-${resp.status}`, sample: text };
-    }
-    let url = null;
-    try {
-      const json = JSON.parse(text);
-      // Different SDKs/versions may return one of these fields:
-      url = json?.linkedin_profile_url || json?.professionalsocmed_profile_url || json?.url || null;
-    } catch {
-      // Sometimes the API returns a plain string URL
-      if (typeof text === "string" && text.startsWith("http")) url = text.trim();
-    }
-    if (url && isLinkedInPublicUrl(url)) return { url: norm(url), step: "proxycurl-hit" };
-    return { url: null, step: "proxycurl-empty", sample: text };
-  } catch (e) {
-    console.warn("[proxycurl] error:", e.message);
-    return { url: null, step: "proxycurl-error", error: e.message };
-  }
-}
-
-// Optional: Resolve company to domain via Proxycurl Company Lookup (costs credits). Disabled by default.
-// async function proxycurlResolveCompanyDomain(companyName) {
-//   if (!companyName || !PROXYCURL_API_KEY) return null;
-//   const ep = "https://nubela.co/proxycurl/api/professionalsocmed/company/resolve";
-//   const p = new URLSearchParams({ company_name: companyName });
-//   try {
-//     const resp = await fetch(`${ep}?${p.toString()}`, {
-//       headers: { "Authorization": `Bearer ${PROXYCURL_API_KEY}` },
-//       signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
-//     });
-//     const txt = await safeText(resp);
-//     if (!resp.ok) return null;
-//     const j = JSON.parse(txt);
-//     // Proxycurl responses vary; try common fields
-//     return j?.company_domain || j?.domain || null;
-//   } catch { return null; }
-// }
+// ---- New: SerpAPI helpers (primary resolver) ----
+function isLinkedInPublicUrl(u = "") { return typeof u === "string" && /linkedin\.com\/in\//i.test(u); }
+function norm(u) { try { return new URL(u).toString(); } catch { return u; } }
 
 async function serpapiFindLinkedInUrl({ firstName, lastName, company }) {
   if (!SERPAPI_KEY) return { url: null, step: "serpapi-skip-no-key" };
@@ -375,49 +302,19 @@ async function serpapiFindLinkedInUrl({ firstName, lastName, company }) {
     const text = await safeText(resp);
     if (!resp.ok) return { url: null, step: `serpapi-http-${resp.status}`, sample: text };
 
-    const j = (async () => { try { return JSON.parse(text); } catch { return {}; } })();
-    const data = await j;
+    let data = {};
+    try { data = JSON.parse(text); } catch {}
     const candidates = []
       .concat(data?.organic_results || [])
       .map(r => r?.link)
       .filter(Boolean);
+
     const url = candidates.find(isLinkedInPublicUrl);
     if (url) return { url: norm(url), step: "serpapi-hit" };
     return { url: null, step: "serpapi-empty", sample: text };
   } catch (e) {
     return { url: null, step: "serpapi-error", error: e.message };
   }
-}
-
-// Unified resolver used by /upload-leads and the dev test route
-async function findPublicUrlSmart({ firstName, lastName, company, salesNavUrl, title, liAtCookie }) {
-  const steps = [];
-
-  // 1) Proxycurl (best quality, fast). Requires or benefits from a company domain.
-  const px = await proxycurlPersonLookup({ firstName, lastName, company, title });
-  steps.push({ step: "proxycurl", ...px });
-  if (px.url) return { url: px.url, steps, provider: "proxycurl" };
-
-  // 2) SerpAPI (search engine fallback)
-  const sa = await serpapiFindLinkedInUrl({ firstName, lastName, company });
-  steps.push({ step: "serpapi", ...sa });
-  if (sa.url) return { url: sa.url, steps, provider: "serpapi" };
-
-  // 3) Your existing cookie-based Sales Nav resolve (if we have li_at and a Sales URL)
-  if (!px.url && liAtCookie && salesNavUrl) {
-    const resolved = await resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie);
-    steps.push({ step: "voyager-sales-profile", ok: !!resolved });
-    if (resolved) return { url: resolved, steps, provider: "linkedin-cookies" };
-  }
-
-  // 4) Naive inference from /sales/lead/<slug>
-  if (salesNavUrl && salesNavUrl.includes("/sales/lead/")) {
-    const infer = derivePublicFromSalesNav(salesNavUrl);
-    steps.push({ step: "derive-sales-lead-slug", ok: !!infer });
-    if (infer) return { url: infer, steps, provider: "naive-derive" };
-  }
-
-  return { url: null, steps, provider: "none" };
 }
 
 // --- Auth Middleware ---
@@ -463,7 +360,7 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// --- Job Queue Endpoints (unchanged) ---
+// --- Job Queue Endpoints ---
 app.post("/jobs", async (req, res) => {
   try {
     const { type, payload, priority = 5 } = req.body || {};
@@ -585,7 +482,7 @@ app.get("/jobs/stats", async (_req, res) => {
   res.json({ counts: { queued: d.queued.length, active: d.active.length, done: d.done.length, failed: d.failed.length } });
 });
 
-// --- Cookies from extension (unchanged) ---
+// --- Cookies from extension ---
 app.post("/store-cookies", (req, res) => {
   try {
     const body = req.body || {};
@@ -624,7 +521,6 @@ app.get("/api/me/liat", authenticateToken, (req, res) => {
   }
 });
 
-// --- Enqueue actions (unchanged) ---
 app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
@@ -646,7 +542,7 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
         userId: email,
         profileUrl,
         note,
-        cookieBundle
+        cookieBundle // may be null; worker can still login with creds+totp
       },
       priority,
       status: "queued",
@@ -664,6 +560,7 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
   }
 });
 
+// 🆕 NEW: enqueue message job (1st-degree messaging flow)
 app.post("/jobs/enqueue-send-message", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
@@ -686,7 +583,7 @@ app.post("/jobs/enqueue-send-message", authenticateToken, async (req, res) => {
         userId: email,
         profileUrl,
         message,
-        cookieBundle
+        cookieBundle // optional; worker also supports creds+totp auth path
       },
       priority,
       status: "queued",
@@ -704,7 +601,8 @@ app.post("/jobs/enqueue-send-message", authenticateToken, async (req, res) => {
   }
 });
 
-// --- Leads upload (now tries Proxycurl -> SerpAPI -> cookies -> inference) ---
+// --- Leads upload ---
+// NOW: Try SerpAPI first to resolve public LinkedIn URL; if not found, fall back to cookies + naive inference.
 app.post("/upload-leads", async (req, res) => {
   if (process.env.LOG_UPLOADS === "true") console.log("Received /upload-leads");
   const { leads, timestamp } = req.body || {};
@@ -714,6 +612,7 @@ app.post("/upload-leads", async (req, res) => {
   }
 
   const liAt = getLatestLiAtForUser(userEmail);
+  if (!liAt) console.warn("[upload-leads] No li_at stored for", userEmail, "- will save Sales Nav URLs as-is.");
 
   const insertLeadSql = `
     INSERT OR IGNORE INTO leads
@@ -747,16 +646,25 @@ app.post("/upload-leads", async (req, res) => {
 
       const profileUrlLegacy = rawLead.profile_url || null;
 
-      // New: Try to find public URL *before* falling back to cookies/derive
+      // --- NEW: Try SerpAPI first if no public URL yet ---
       if (!publicUrl) {
-        const { url: found, steps } = await findPublicUrlSmart({
-          firstName, lastName, company: organization, salesNavUrl, title, liAtCookie: liAt
-        });
-        if (process.env.LOG_UPLOADS === "true") console.log("[resolve]", { firstName, lastName, organization, steps });
-        if (found) publicUrl = found;
+        const ser = await serpapiFindLinkedInUrl({ firstName, lastName, company: organization });
+        if (process.env.LOG_UPLOADS === "true") console.log("[serpapi]", { firstName, lastName, organization, step: ser.step, found: ser.url || null });
+        if (ser.url) publicUrl = ser.url;
       }
 
-      const public_profile_url_to_store = publicUrl || null;
+      // Fall back to your existing cookie-based Sales Navigator resolver
+      if (!publicUrl && salesNavUrl && liAt) {
+        publicUrl = await resolveSalesNavToPublicUrl(salesNavUrl, liAt);
+      }
+
+      // Final fallback: naive inference from /sales/lead/<slug>
+      let inferredPublic = null;
+      if (!publicUrl && salesNavUrl && salesNavUrl.includes("/sales/lead/")) {
+        inferredPublic = derivePublicFromSalesNav(salesNavUrl);
+      }
+
+      const public_profile_url_to_store = publicUrl || inferredPublic || null;
 
       if (!public_profile_url_to_store && !profileUrlLegacy && !salesNavUrl) { skipped++; return; }
 
@@ -766,7 +674,7 @@ app.post("/upload-leads", async (req, res) => {
       );
       if (info.changes > 0) inserted++; else skipped++;
     } catch (e) {
-      console.warn("processOne error:", e.message);
+      if (process.env.LOG_UPLOADS === "true") console.warn("processOne error:", e.message);
       skipped++;
     }
   }
@@ -791,7 +699,7 @@ app.post("/upload-leads", async (req, res) => {
   });
 });
 
-// --- Leads / Excel / Automation (unchanged) ---
+// --- Leads / Excel / Automation ---
 app.get("/api/leads", authenticateToken, (req, res) => {
   try {
     const rows = db.prepare("SELECT * FROM leads WHERE user_email = ? ORDER BY scraped_at DESC").all(req.user.email);
@@ -804,7 +712,7 @@ app.get("/api/leads", authenticateToken, (req, res) => {
 
 app.get("/download-leads-excel", authenticateToken, async (req, res) => {
   try {
-    const rows = db.prepare("SELECT * FROM leads WHERE user_email = ? ORDER by scraped_at DESC").all(req.user.email);
+    const rows = db.prepare("SELECT * FROM leads WHERE user_email = ? ORDER BY scraped_at DESC").all(req.user.email);
     if (rows.length === 0) return res.status(404).send(`No leads found for ${req.user.email}.`);
 
     const wb = new ExcelJS.Workbook();
@@ -841,7 +749,6 @@ app.get("/download-leads-excel", authenticateToken, async (req, res) => {
   }
 });
 
-// --- Runner helpers (unchanged) ---
 app.get("/api/automation/get-next-leads", authenticateToken, (req, res) => {
   const limit = parseInt(req.query.limit || "1", 10);
   const email = req.user.email;
@@ -952,7 +859,7 @@ app.post("/api/automation/update-status", authenticateToken, (req, res) => {
   }
 });
 
-// --- Connection status & logs (unchanged) ---
+// --- Connection status & logs ---
 const LIVE_CHECK_COOLDOWN_MS = 10 * 60 * 1000;
 
 app.get("/api/connection/check", authenticateToken, async (req, res) => {
@@ -1068,10 +975,11 @@ app.get("/api/connection/logs", authenticateToken, (req, res) => {
   }
 });
 
-// --- Connect flow endpoints (unchanged) ---
+// --- Connect flow endpoints (UI -> backend) ---
 app.post("/api/connect/start", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
+    // Enqueue AUTH_CHECK for this user. Worker will save storageState per userId=email.
     const d = await readJobs();
     const job = {
       id: uuidv4(),
@@ -1087,6 +995,7 @@ app.post("/api/connect/start", authenticateToken, async (req, res) => {
     d.queued.sort((a, b) => a.priority - b.priority);
     await writeJobs(d);
 
+    // Compose viewer URL if configured
     const viewerUrl = VIEWER_BASE_URL
       ? `${VIEWER_BASE_URL.replace(/\/+$/,"")}/vnc_lite.html?autoconnect=1&view_only=0&password=${encodeURIComponent(NOVNC_PASSWORD)}`
       : null;
@@ -1134,6 +1043,7 @@ app.post("/api/connect/test", authenticateToken, async (req, res) => {
 });
 
 // --- NEW: Account settings (Sprouts-mode) ---
+// Save LinkedIn creds
 app.post("/api/account/creds", authenticateToken, (req, res) => {
   const email = req.user.email;
   const { username, password } = req.body || {};
@@ -1151,7 +1061,114 @@ app.post("/api/account/creds", authenticateToken, (req, res) => {
   res.json({ ok: true });
 });
 
+// Save TOTP secret
 app.post("/api/account/totp", authenticateToken, (req, res) => {
   const email = req.user.email;
   const { totpSecret } = req.body || {};
-  if (!totpSecret) return res.status(400).json({ ok: false, error: "totpSecret required
+  if (!totpSecret) return res.status(400).json({ ok: false, error: "totpSecret required" });
+
+  const up = db.prepare(`
+    INSERT INTO account_settings (email, totp_secret_enc, updated_at)
+    VALUES (?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(email) DO UPDATE SET
+      totp_secret_enc=excluded.totp_secret_enc,
+      updated_at=CURRENT_TIMESTAMP
+  `);
+  up.run(email, enc(totpSecret));
+  res.json({ ok: true });
+});
+
+// Save proxy
+app.post("/api/account/proxy", authenticateToken, (req, res) => {
+  const email = req.user.email;
+  const { server, username, password } = req.body || {};
+  const up = db.prepare(`
+    INSERT INTO account_settings (email, proxy_server, proxy_username_enc, proxy_password_enc, updated_at)
+    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(email) DO UPDATE SET
+      proxy_server=excluded.proxy_server,
+      proxy_username_enc=excluded.proxy_username_enc,
+      proxy_password_enc=excluded.proxy_password_enc,
+      updated_at=CURRENT_TIMESTAMP
+  `);
+  up.run(email, server || null, username ? enc(username) : null, password ? enc(password) : null);
+  res.json({ ok: true });
+});
+
+// Masked read for UI
+app.get("/api/account/settings", authenticateToken, (req, res) => {
+  const email = req.user.email;
+  const row = db.prepare("SELECT * FROM account_settings WHERE email = ?").get(email) || {};
+  res.json({
+    ok: true,
+    settings: {
+      username: row.li_username_enc ? "saved" : null,
+      password: row.li_password_enc ? "saved" : null,
+      totp:     row.totp_secret_enc ? "saved" : null,
+      proxy: {
+        server: row.proxy_server || null,
+        username: row.proxy_username_enc ? "saved" : null,
+        password: row.proxy_password_enc ? "saved" : null
+      },
+      updated_at: row.updated_at || null
+    }
+  });
+});
+
+// Worker read (decrypted)
+app.get("/worker/account/settings", requireWorkerAuth, (req, res) => {
+  const userId = req.query.userId;
+  if (!userId) return res.status(400).json({ ok: false, error: "userId required" });
+  const row = db.prepare("SELECT * FROM account_settings WHERE email = ?").get(userId);
+  if (!row) return res.json({ ok: true, settings: null });
+  res.json({
+    ok: true,
+    settings: {
+      username: row.li_username_enc ? dec(row.li_username_enc) : null,
+      password: row.li_password_enc ? dec(row.li_password_enc) : null,
+      totpSecret: row.totp_secret_enc ? dec(row.totp_secret_enc) : null,
+      proxy: {
+        server: row.proxy_server || null,
+        username: row.proxy_username_enc ? dec(row.proxy_username_enc) : null,
+        password: row.proxy_password_enc ? dec(row.proxy_password_enc) : null
+      }
+    }
+  });
+});
+
+// --- Dev: test resolver from the browser (kept the same path name you used) ---
+// Example:
+//   /api/dev/rapidapi-test?first=Adam&last=Selipsky&company=Amazon
+app.get("/api/dev/rapidapi-test", async (req, res) => {
+  try {
+    const first = (req.query.first || "").trim();
+    const last  = (req.query.last  || "").trim();
+    const company = (req.query.company || "").trim();
+
+    const ser = await serpapiFindLinkedInUrl({ firstName: first, lastName: last, company });
+    const found = ser.url || null;
+    res.json({
+      ok: true,
+      found,
+      provider: found ? "serpapi" : "none",
+      strategy: "serpapi-first",
+      step: ser.step || null
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// --- Root (Dashboard) ---
+app.get("/", (req, res) => {
+  const file = path.join(__dirname, "public", "dashboard.html");
+  fs.pathExists(file).then(exists => {
+    if (exists) return res.sendFile(file);
+    res.type("text/plain").send("LinqBridge API OK");
+  });
+});
+
+// --- Start ---
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server is running on port ${PORT}`);
+});
