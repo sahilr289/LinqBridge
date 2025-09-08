@@ -1,5 +1,6 @@
 // index.js — LinqBridge backend (FINAL with "Sprouts-mode": creds+TOTP+proxy storage, worker fetch)
 // + SerpAPI integration for public LinkedIn URL resolution
+// + User-configurable follow-up schedule & Start Automation
 
 const express = require("express");
 const cors = require("cors");
@@ -18,7 +19,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key_change_this_for_prod";
 const ENC_SECRET = process.env.ENC_SECRET || "change_me_32+chars_in_prod";
-const SERPAPI_KEY = process.env.SERPAPI_KEY || ""; // <-- add your SerpAPI key in env
+const SERPAPI_KEY = process.env.SERPAPI_KEY || "";
 const SERPAPI_DEBUG = (/^(true|1|yes)$/i).test(process.env.SERPAPI_DEBUG || "false");
 
 // --- Optional viewer info for Connect flow ---
@@ -162,6 +163,18 @@ function initializeDatabase() {
       proxy_server TEXT,
       proxy_username_enc TEXT,
       proxy_password_enc TEXT,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  // NEW: user-configurable follow-up schedule (offsets in days)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS automation_prefs (
+      email TEXT PRIMARY KEY,
+      connect_offset_days INTEGER DEFAULT 0,
+      msg1_after_accept_days INTEGER DEFAULT 1,
+      msg2_after_msg1_days INTEGER DEFAULT 4,
+      msg3_after_msg2_days INTEGER DEFAULT 7,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
   `);
@@ -383,6 +396,26 @@ async function findPublicUrlSmart({ firstName, lastName, company, salesNavUrl, e
 
   return { url: null, steps, provider: "none" };
 }
+
+// --- Automation prefs helpers ---
+const DEFAULT_AUTOMATION_PREFS = Object.freeze({
+  connect_offset_days: 0,
+  msg1_after_accept_days: 1,
+  msg2_after_msg1_days: 4,
+  msg3_after_msg2_days: 7,
+});
+function getAutomationPrefs(email) {
+  try {
+    const row = db.prepare(`
+      SELECT connect_offset_days, msg1_after_accept_days, msg2_after_msg1_days, msg3_after_msg2_days
+      FROM automation_prefs WHERE email = ?
+    `).get(email);
+    return { ...DEFAULT_AUTOMATION_PREFS, ...(row || {}) };
+  } catch {
+    return { ...DEFAULT_AUTOMATION_PREFS };
+  }
+}
+function addDaysISO(n) { return new Date(Date.now() + n * 86400000).toISOString(); }
 
 // --- Auth Middleware ---
 function authenticateToken(req, res, next) {
@@ -866,34 +899,139 @@ app.get("/api/automation/runner/tick", authenticateToken, (req, res) => {
   }
 });
 
+// 🔧 NEW: save/read user schedule
+app.get("/api/automation/prefs", authenticateToken, (req, res) => {
+  const prefs = getAutomationPrefs(req.user.email);
+  res.json({ ok: true, prefs });
+});
+app.post("/api/automation/prefs", authenticateToken, (req, res) => {
+  const email = req.user.email;
+  const body = req.body || {};
+  const toInt = (v, d) => {
+    const n = Number.parseInt(v, 10);
+    return Number.isFinite(n) && n >= 0 ? n : d;
+  };
+  const next = {
+    connect_offset_days:    toInt(body.connect_offset_days,    DEFAULT_AUTOMATION_PREFS.connect_offset_days),
+    msg1_after_accept_days: toInt(body.msg1_after_accept_days, DEFAULT_AUTOMATION_PREFS.msg1_after_accept_days),
+    msg2_after_msg1_days:   toInt(body.msg2_after_msg1_days,   DEFAULT_AUTOMATION_PREFS.msg2_after_msg1_days),
+    msg3_after_msg2_days:   toInt(body.msg3_after_msg2_days,   DEFAULT_AUTOMATION_PREFS.msg3_after_msg2_days),
+  };
+  db.prepare(`
+    INSERT INTO automation_prefs (email, connect_offset_days, msg1_after_accept_days, msg2_after_msg1_days, msg3_after_msg2_days, updated_at)
+    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(email) DO UPDATE SET
+      connect_offset_days=excluded.connect_offset_days,
+      msg1_after_accept_days=excluded.msg1_after_accept_days,
+      msg2_after_msg1_days=excluded.msg2_after_msg1_days,
+      msg3_after_msg2_days=excluded.msg3_after_msg2_days,
+      updated_at=CURRENT_TIMESTAMP
+  `).run(email, next.connect_offset_days, next.msg1_after_accept_days, next.msg2_after_msg1_days, next.msg3_after_msg2_days);
+  res.json({ ok: true, prefs: next });
+});
+
+// 🔧 NEW: Start automation for specified lead IDs (enqueue connection now or schedule later)
+app.post("/api/automation/start", authenticateToken, async (req, res) => {
+  const email = req.user.email;
+  const { lead_ids = [], note = null } = req.body || {};
+  if (!Array.isArray(lead_ids) || lead_ids.length === 0) {
+    return res.status(400).json({ ok: false, error: "lead_ids required (array)" });
+  }
+
+  const prefs = getAutomationPrefs(email);
+  const li = db.prepare("SELECT li_at, jsessionid, bcookie FROM cookies WHERE email = ? ORDER BY id DESC LIMIT 1").get(email);
+  const cookieBundle = li?.li_at ? { li_at: li.li_at, jsessionid: li.jsessionid || null, bcookie: li.bcookie || null } : null;
+
+  const sel = db.prepare(`SELECT id, COALESCE(public_profile_url, profile_url, sales_nav_url) AS profile_url FROM leads WHERE id = ? AND user_email = ?`);
+  const upd = db.prepare(`UPDATE leads SET automation_status='pending_connect', connection_note = COALESCE(?, connection_note), next_action_due_date = ? WHERE id = ? AND user_email = ?`);
+
+  let started = 0, queuedNow = 0, scheduled = 0;
+  const connectNow = prefs.connect_offset_days === 0;
+
+  for (const id of lead_ids) {
+    const row = sel.get(id, email);
+    if (!row || !row.profile_url) continue;
+
+    const due = connectNow ? null : addDaysISO(prefs.connect_offset_days);
+    upd.run(note || null, due, id, email);
+    started++;
+
+    if (connectNow) {
+      const d = await readJobs();
+      const job = {
+        id: uuidv4(),
+        type: "SEND_CONNECTION",
+        payload: {
+          tenantId: "default",
+          userId: email,
+          profileUrl: row.profile_url,
+          note: note || null,
+          cookieBundle
+        },
+        priority: 3,
+        status: "queued",
+        enqueuedAt: new Date().toISOString(),
+        attempts: 0,
+        lastError: null,
+      };
+      d.queued.push(job);
+      d.queued.sort((a, b) => a.priority - b.priority);
+      await writeJobs(d);
+      queuedNow++;
+    } else {
+      scheduled++;
+    }
+  }
+
+  res.json({ ok: true, started, queued_now: queuedNow, scheduled });
+});
+
+// 🔧 NEW: status update uses user schedule (no random delays)
 app.post("/api/automation/update-status", authenticateToken, (req, res) => {
   const { lead_id, status, action_details = {} } = req.body || {};
   const email = req.user.email;
   if (!lead_id || !status) return res.status(400).json({ success: false, message: "Missing lead_id or status." });
 
+  const prefs = getAutomationPrefs(email);
   let setClauses = [`automation_status = ?`, `last_action_timestamp = CURRENT_TIMESTAMP`];
   const params = [status];
 
   let nextActionDate = null;
   switch (status) {
     case "connection_sent":
-      nextActionDate = new Date(Date.now() + (Math.random() * (5 - 3) + 3) * 86400000).toISOString();
+      // wait for acceptance; (optional: you can set a gentle check-in a few days later)
       if (action_details.connection_note_sent) { setClauses.push(`connection_note = ?`); params.push(action_details.connection_note_sent); }
+      nextActionDate = null;
       break;
+
     case "accepted":
-      nextActionDate = new Date(Date.now() + (Math.random() * (2 - 1) + 1) * 3600000).toISOString();
+      // schedule msg1 after N days
+      nextActionDate = addDaysISO(prefs.msg1_after_accept_days);
       break;
+
     case "msg1_sent":
-    case "msg2_sent":
-      nextActionDate = new Date(Date.now() + (Math.random() * (7 - 4) + 4) * 86400000).toISOString();
+      // schedule msg2 after M days
+      nextActionDate = addDaysISO(prefs.msg2_after_msg1_days);
       break;
+
+    case "msg2_sent":
+      // schedule msg3 after K days
+      nextActionDate = addDaysISO(prefs.msg3_after_msg2_days);
+      break;
+
     case "replied":
     case "skipped":
     case "error":
       nextActionDate = null;
       break;
+
     case "profile_viewed":
+      // keep short delay before next check (12–24h)
       nextActionDate = new Date(Date.now() + (Math.random() * (24 - 12) + 12) * 3600000).toISOString();
+      break;
+
+    default:
+      nextActionDate = null;
       break;
   }
 
@@ -913,6 +1051,51 @@ app.post("/api/automation/update-status", authenticateToken, (req, res) => {
     console.error("update-status error:", e);
     return res.status(500).json({ success: false, message: "Internal server error updating lead status." });
   }
+});
+
+// 🔧 NEW: list actions due now so UI can enqueue corresponding jobs
+app.get("/api/automation/get-due-actions", authenticateToken, (req, res) => {
+  const email = req.user.email;
+  const limit = Math.min(parseInt(req.query.limit || "20", 10), 100);
+
+  const rows = db.prepare(`
+    SELECT id, first_name, last_name, organization, title,
+           COALESCE(public_profile_url, profile_url, sales_nav_url) AS profile_url,
+           automation_status, connection_note, followup_1_message, followup_2_message, followup_3_message
+    FROM leads
+    WHERE user_email = ?
+      AND next_action_due_date IS NOT NULL
+      AND next_action_due_date <= CURRENT_TIMESTAMP
+    ORDER BY next_action_due_date ASC
+    LIMIT ?;
+  `).all(email, limit);
+
+  const actions = [];
+  for (const r of rows) {
+    if (!r.profile_url) continue;
+
+    if (r.automation_status === "pending_connect") {
+      actions.push({ lead_id: r.id, action: "SEND_CONNECTION", profileUrl: r.profile_url, note: r.connection_note || null });
+      continue;
+    }
+    if (r.automation_status === "accepted") {
+      const msg = r.followup_1_message || "";
+      actions.push({ lead_id: r.id, action: "SEND_MESSAGE", which: "msg1", profileUrl: r.profile_url, message: msg });
+      continue;
+    }
+    if (r.automation_status === "msg1_sent") {
+      const msg = r.followup_2_message || "";
+      actions.push({ lead_id: r.id, action: "SEND_MESSAGE", which: "msg2", profileUrl: r.profile_url, message: msg });
+      continue;
+    }
+    if (r.automation_status === "msg2_sent") {
+      const msg = r.followup_3_message || "";
+      actions.push({ lead_id: r.id, action: "SEND_MESSAGE", which: "msg3", profileUrl: r.profile_url, message: msg });
+      continue;
+    }
+  }
+
+  res.json({ ok: true, actions });
 });
 
 // --- Connection status & logs ---

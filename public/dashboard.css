@@ -1,59 +1,271 @@
-/* --- Connect tab extras (append) --- */
+/* =========================================================
+   LinqBridge Dashboard — final CSS
+   ========================================================= */
 
-/* More badge states */
-.badge.cooldown { background: var(--info-bg);  color: var(--info-text);  border-color: #c7d2fe; }
-.badge.warn     { background: var(--warn-bg);  color: var(--warn-text);  border-color: #fed7aa; }
-.badge.paused   { background: #ffffff;         color: #475569;          border-color: var(--border); }
+/* ---------- CSS variables ---------- */
+:root{
+  --bg:            #f5f7fb;
+  --card:          #ffffff;
+  --text:          #0f172a;
+  --muted:         #64748b;
+  --brand:         #2563eb;   /* primary */
+  --brand-600:     #1d4ed8;
+  --danger:        #ef4444;
+  --danger-600:    #dc2626;
+  --warn:          #f59e0b;
+  --ok:            #10b981;
 
-/* Small status dot (use with text) */
-.status {
-  display: inline-flex; align-items: center; gap: 6px;
-  font-size: 13px; color: var(--muted);
+  --border:        #e5e7eb;
+  --shadow:        0 8px 24px rgba(15,23,42,0.06);
+
+  --info-bg:       #eff6ff;
+  --info-text:     #1e40af;
+  --success-bg:    #ecfdf5;
+  --success-text:  #065f46;
+  --warn-bg:       #fffbeb;
+  --warn-text:     #92400e;
+  --error-bg:      #fef2f2;
+  --error-text:    #991b1b;
+
+  --radius:        12px;
+  --radius-sm:     8px;
+  --radius-lg:     16px;
 }
-.status .dot {
-  width: 8px; height: 8px; border-radius: 50%;
-  background: #cbd5e1; /* default */
+
+/* ---------- base ---------- */
+*{ box-sizing: border-box; }
+html,body{ height:100%; }
+body{
+  margin:0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
-.status .dot.ok    { background: #10b981; }
-.status .dot.fail  { background: #ef4444; }
-.status .dot.warn  { background: #f59e0b; }
-.status .dot.info  { background: #3b82f6; }
 
-/* Button variants for Connect tab */
-.btn.secondary { background: #f8fafc; border-color: var(--border); color: #111827; }
-.btn.ghost     { background: transparent; border-color: transparent; color: var(--brand); }
-.btn.block     { display: block; width: 100%; }
+a{ color: var(--brand); text-decoration: none; }
+a:hover{ text-decoration: underline; }
 
-/* Loading spinner for “Linking…” */
-.spinner {
-  width: 16px; height: 16px; border: 2px solid #d1d5db; border-top-color: var(--brand);
-  border-radius: 50%; display: inline-block; animation: spin 0.9s linear infinite;
-  vertical-align: -3px; margin-right: 8px;
+/* ---------- layout ---------- */
+.container{
+  max-width: 1060px;
+  margin: 32px auto;
+  padding: 0 16px;
+}
+h1{
+  margin: 0 0 16px;
+  font-size: 28px;
+  letter-spacing: -0.01em;
+}
+h3{
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+
+.card{
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  box-shadow: var(--shadow);
+  margin-bottom: 16px;
+}
+
+/* ---------- tabs (auth + app) ---------- */
+.tabs{ display: flex; gap: 8px; margin-bottom: 12px; }
+.tab{
+  background: #f8fafc;
+  border: 1px solid var(--border);
+  color: #111827;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.tab.active{
+  background: var(--brand);
+  color: #fff;
+  border-color: var(--brand);
+}
+
+/* ---------- forms ---------- */
+.form{ display: none; }
+.form.form-active{ display: block; }
+.form input{
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+  margin: 6px 0;
+  font-size: 14px;
+  background: #fff;
+}
+.form input:focus{
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px rgba(37,99,235,0.12);
+}
+
+/* ---------- buttons ---------- */
+.btn{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px 14px;
+  font-size: 14px;
+  line-height: 1.1;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: #f8fafc;
+  color: #111827;
+  cursor: pointer;
+  transition: transform .03s ease, background .15s ease, border-color .15s ease;
+  user-select: none;
+  text-decoration: none;
+}
+.btn:hover{ background: #f3f4f6; }
+.btn:active{ transform: translateY(1px); }
+
+.btn.primary{
+  background: var(--brand);
+  color:#fff;
+  border-color: var(--brand);
+}
+.btn.primary:hover{ background: var(--brand-600); border-color: var(--brand-600); }
+
+.btn.danger{
+  background: var(--danger);
+  color:#fff;
+  border-color: var(--danger);
+}
+.btn.danger:hover{ background: var(--danger-600); border-color: var(--danger-600); }
+
+.btn.secondary{ background: #f8fafc; border: 1px solid var(--border); color: #111827; }
+.btn.ghost{ background: transparent; border-color: transparent; color: var(--brand); }
+.btn.block{ display:block; width:100%; }
+.btn.small{ padding: 4px 8px; font-size: 12px; line-height: 1.1; }
+
+/* ---------- toolbar ---------- */
+.toolbar{
+  display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px;
+}
+.toolbar .app-tabs{ display:flex; gap:8px; }
+
+/* ---------- messages ---------- */
+.msg{
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: #f8fafc;
+  color: #0f172a;
+}
+.msg.info{    background: var(--info-bg);    color: var(--info-text);    border-color: #bfdbfe; }
+.msg.success{ background: var(--success-bg); color: var(--success-text); border-color: #bbf7d0; }
+.msg.warning{ background: var(--warn-bg);    color: var(--warn-text);    border-color: #fed7aa; }
+.msg.error{   background: var(--error-bg);   color: var(--error-text);   border-color: #fecaca; }
+
+/* ---------- badges ---------- */
+.badge{
+  display:inline-flex; align-items:center; gap:6px;
+  padding: 4px 8px; font-size: 12px; line-height: 1.1;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: #334155; background: #f8fafc;
+}
+.badge.ok       { background: #dcfce7; color:#166534; border:1px solid #bbf7d0; }
+.badge.fail     { background: #fee2e2; color:#991b1b; border:1px solid #fecaca; }
+.badge.info     { background: var(--info-bg); color: var(--info-text); border:1px solid #bfdbfe; }
+.badge.cooldown { background: var(--info-bg); color: var(--info-text); border:1px solid #c7d2fe; }
+.badge.warn     { background: var(--warn-bg); color: var(--warn-text); border:1px solid #fed7aa; }
+.badge.paused   { background: #ffffff; color:#475569; border:1px solid var(--border); }
+
+/* ---------- status dot (Connect tab) ---------- */
+.status{
+  display:inline-flex; align-items:center; gap:6px;
+  font-size:13px; color: var(--muted);
+}
+.status .dot{
+  width:8px; height:8px; border-radius:50%;
+  background:#cbd5e1; /* default */
+}
+.status .dot.ok{   background: var(--ok); }
+.status .dot.fail{ background: #ef4444; }
+.status .dot.warn{ background: var(--warn); }
+.status .dot.info{ background: #3b82f6; }
+
+/* ---------- spinner ---------- */
+.spinner{
+  width:16px; height:16px; border:2px solid #d1d5db; border-top-color: var(--brand);
+  border-radius:50%; display:inline-block; animation: spin .9s linear infinite;
+  vertical-align:-3px; margin-right:8px;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* Simple layout helpers */
-.row   { display: flex; gap: 10px; align-items: center; }
-.stack { display: grid; gap: 10px; }
-.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-@media (max-width: 720px) { .grid-2 { grid-template-columns: 1fr; } }
+/* ---------- app views ---------- */
+.app-view{ display:none; }
+.app-view.view-active{ display:block; }
 
-/* Link styling for viewer URL / actions */
-.link { color: var(--brand); text-decoration: none; }
-.link:hover { text-decoration: underline; }
+/* ---------- tables ---------- */
+table{ width:100%; border-collapse: collapse; }
+thead th{
+  text-align:left; font-weight:600; font-size:13px; color:#475569;
+  border-bottom:1px solid var(--border);
+  padding:10px 8px;
+  background:#f9fafb;
+}
+tbody td{
+  border-bottom:1px solid var(--border);
+  padding:10px 8px; font-size:14px; color:#111827; vertical-align: top;
+}
+#leads-table td a{ word-break: break-word; }
 
-/* Inline code (to show sample curl, etc.) */
-.code {
+/* ---------- helpers ---------- */
+.row   { display:flex; gap:10px; align-items:center; }
+.stack { display:grid; gap:10px; }
+.grid-2{ display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+@media (max-width: 720px){
+  .grid-2{ grid-template-columns: 1fr; }
+}
+
+/* viewer link style (optional) */
+.link{ color: var(--brand); text-decoration: none; }
+.link:hover{ text-decoration: underline; }
+
+/* inline code sample */
+.code{
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px; background: #f8fafc; border: 1px solid var(--border);
-  padding: 2px 6px; border-radius: 6px; color: #0f172a;
+  font-size: 12px; background:#f8fafc; border:1px solid var(--border);
+  padding:2px 6px; border-radius:6px; color:#0f172a;
 }
 
-/* Small helper text */
-.help { font-size: 12px; color: var(--muted); }
-
-/* Section divider used in Connect tab */
-.hr {
-  height: 1px; background: var(--border); border: 0;
-  margin: 12px 0;
+/* section divider */
+.hr{
+  height:1px; background: var(--border); border:0;
+  margin:12px 0;
 }
+
+/* ---------- inputs on Connect tab ---------- */
+#view-connection input[type="text"],
+#view-connection input[type="password"],
+#view-connection input[type="email"],
+#view-connection input[type="url"],
+#view-connection input[type="number"]{
+  width: 100%;
+  max-width: 420px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+  font-size: 14px;
+  background: #fff;
+}
+#view-connection input[type="number"]{ max-width: 120px; }
+#view-connection input:focus{
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px rgba(37,99,235,0.12);
+}
+
+/* ---------- small tweaks ---------- */
+#whoami{ font-size:13px; color: var(--muted); margin-right: 6px; }
+table a.btn{ text-decoration: none; }  /* if buttons placed inside tables */

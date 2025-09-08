@@ -54,6 +54,8 @@
           <div>
             <button id="reload-btn" class="btn">Reload Leads</button>
             <button id="download-btn" class="btn">Download Excel</button>
+            <!-- NEW: run scheduler -->
+            <button id="run-due-btn" class="btn primary">Run Due Actions</button>
           </div>
         </div>
 
@@ -67,6 +69,8 @@
               <th>Public URL</th>
               <th>Sales Nav URL</th>
               <th>Status</th>
+              <!-- NEW: actions col -->
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -102,7 +106,7 @@
           </p>
         </div>
 
-        <!-- NEW: Account Settings (Sprouts-style) -->
+        <!-- Account Settings (Sprouts-style) -->
         <div class="section">
           <h3>LinkedIn Account (stored securely)</h3>
           <div id="acct-msg" class="msg" style="display:none;"></div>
@@ -157,6 +161,44 @@
           <div><span id="proxy-status" class="help"></span></div>
 
           <div class="help" id="settings-updated-at" style="margin-top:8px;"></div>
+        </div>
+
+        <!-- NEW: Automation schedule -->
+        <div class="section">
+          <h3>Automation schedule</h3>
+          <p class="help">Choose when to send the connection request and each follow-up after acceptance.</p>
+
+          <div id="prefs-msg" class="msg" style="display:none;"></div>
+
+          <div class="grid-2" style="margin-top:8px;">
+            <div class="stack">
+              <label>Connection request delay (days from Day 0)</label>
+              <input id="pref-connect-offset" type="number" min="0" value="0"/>
+            </div>
+            <div class="stack">
+              <label>Message 1: days after accept</label>
+              <input id="pref-msg1-days" type="number" min="0" value="1"/>
+            </div>
+          </div>
+
+          <div class="grid-2" style="margin-top:8px;">
+            <div class="stack">
+              <label>Message 2: days after Message 1</label>
+              <input id="pref-msg2-days" type="number" min="0" value="4"/>
+            </div>
+            <div class="stack">
+              <label>Message 3: days after Message 2</label>
+              <input id="pref-msg3-days" type="number" min="0" value="7"/>
+            </div>
+          </div>
+
+          <div class="row" style="margin-top:10px;">
+            <button id="save-prefs-btn" class="btn">Save Schedule</button>
+          </div>
+
+          <p class="help" style="margin-top:8px;">
+            Use <b>Run Due Actions</b> (top of Leads tab) to queue anything that’s due now.
+          </p>
         </div>
 
         <div class="section">

@@ -1,4 +1,5 @@
 // dashboard.js — LinqBridge Dashboard (Leads + Connect + Sprouts-style account settings)
+// + Automation prefs, Start per-lead, Run Due Actions
 
 const API_BASE = ""; // same-origin (served by your backend)
 const LS_TOKEN = "lb_token";
@@ -41,7 +42,6 @@ async function api(path, { method = "GET", headers = {}, body } = {}) {
   const ct = res.headers.get("content-type") || "";
   const text = await res.text();
   if (!ct.includes("application/json")) {
-    // Pass through raw on error
     if (!res.ok) throw new Error(text || `HTTP ${res.status}`);
     return { _raw: text, _status: res.status };
   }
@@ -131,11 +131,14 @@ function switchAppView(view) {
 }
 
 // ---------- leads ----------
+let CURRENT_LEADS = [];
+
 async function loadLeads() {
   const msg = $("app-msg");
   try {
     const data = await api("/api/leads");
-    renderLeadsTable(data.leads || []);
+    CURRENT_LEADS = data.leads || [];
+    renderLeadsTable(CURRENT_LEADS);
     hide(msg);
   } catch (e) {
     setMsg(msg, e.message || "Failed to load leads.", "error");
@@ -147,6 +150,8 @@ function renderLeadsTable(rows) {
   tbody.innerHTML = "";
   rows.forEach(r => {
     const tr = document.createElement("tr");
+    tr.dataset.leadId = r.id;
+
     const td = (v) => {
       const t = document.createElement("td");
       if (typeof v === "string" && v.startsWith("http")) {
@@ -158,6 +163,7 @@ function renderLeadsTable(rows) {
       }
       return t;
     };
+
     tr.appendChild(td(r.first_name));
     tr.appendChild(td(r.last_name));
     tr.appendChild(td(r.organization));
@@ -165,6 +171,18 @@ function renderLeadsTable(rows) {
     tr.appendChild(td(r.public_profile_url));
     tr.appendChild(td(r.sales_nav_url || r.profile_url));
     tr.appendChild(td(r.automation_status));
+
+    // Actions column (Start button)
+    const actionsTd = document.createElement("td");
+    const startBtn = document.createElement("button");
+    startBtn.textContent = "Start";
+    startBtn.className = "btn btn-xs";
+    startBtn.addEventListener("click", async () => {
+      await startAutomationForLead(r);
+    });
+    actionsTd.appendChild(startBtn);
+    tr.appendChild(actionsTd);
+
     tbody.appendChild(tr);
   });
 }
@@ -188,6 +206,109 @@ async function downloadExcel() {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
+}
+
+// ---------- automation (prefs, start, run-due) ----------
+async function loadAutomationPrefs() {
+  if (!hasEl("pref-connect-offset")) return; // no UI present; skip
+  try {
+    const { prefs } = await api("/api/automation/prefs");
+    setVal("pref-connect-offset", prefs.connect_offset_days ?? 0);
+    setVal("pref-msg1-days", prefs.msg1_after_accept_days ?? 1);
+    setVal("pref-msg2-days", prefs.msg2_after_msg1_days ?? 4);
+    setVal("pref-msg3-days", prefs.msg3_after_msg2_days ?? 7);
+  } catch (e) {
+    setMsg($("prefs-msg"), e.message || "Failed to load schedule.", "error");
+  }
+}
+
+async function saveAutomationPrefs() {
+  const msg = $("prefs-msg");
+  clearMsg(msg);
+  try {
+    const payload = {
+      connect_offset_days:    parseInt(val("pref-connect-offset") || "0", 10),
+      msg1_after_accept_days: parseInt(val("pref-msg1-days") || "1", 10),
+      msg2_after_msg1_days:   parseInt(val("pref-msg2-days") || "4", 10),
+      msg3_after_msg2_days:   parseInt(val("pref-msg3-days") || "7", 10),
+    };
+    await api("/api/automation/prefs", { method: "POST", body: JSON.stringify(payload) });
+    setMsg(msg, "Schedule saved.", "success");
+  } catch (e) {
+    setMsg(msg, e.message || "Failed to save schedule.", "error");
+  }
+}
+
+async function startAutomationForLead(lead) {
+  const msg = $("app-msg");
+  clearMsg(msg);
+  try {
+    const note = lead.connection_note || ""; // optional; could also prompt user here
+    await api("/api/automation/start", {
+      method: "POST",
+      body: JSON.stringify({ lead_ids: [lead.id], note })
+    });
+    setMsg(msg, `Automation started for ${lead.first_name || ""} ${lead.last_name || ""}.`, "success");
+    await loadLeads();
+  } catch (e) {
+    setMsg(msg, e.message || "Failed to start automation.", "error");
+  }
+}
+
+async function runDueActions() {
+  const msg = $("app-msg");
+  clearMsg(msg);
+  try {
+    const due = await api("/api/automation/get-due-actions");
+    const actions = due.actions || [];
+    if (!actions.length) {
+      setMsg(msg, "No actions due right now.", "info");
+      return;
+    }
+
+    let enq = 0, upd = 0, fail = 0;
+
+    for (const a of actions) {
+      try {
+        if (a.action === "SEND_CONNECTION") {
+          await api("/jobs/enqueue-send-connection", {
+            method: "POST",
+            body: JSON.stringify({ profileUrl: a.profileUrl, note: a.note || null })
+          });
+          enq++;
+          // mark status -> connection_sent (schedules next step according to prefs)
+          await api("/api/automation/update-status", {
+            method: "POST",
+            body: JSON.stringify({ lead_id: a.lead_id, status: "connection_sent", action_details: { connection_note_sent: a.note || null } })
+          });
+          upd++;
+        } else if (a.action === "SEND_MESSAGE") {
+          await api("/jobs/enqueue-send-message", {
+            method: "POST",
+            body: JSON.stringify({ profileUrl: a.profileUrl, message: a.message || "" })
+          });
+          enq++;
+          const status =
+            a.which === "msg1" ? "msg1_sent" :
+            a.which === "msg2" ? "msg2_sent" :
+            a.which === "msg3" ? "msg3_sent" :
+            "msg1_sent";
+          await api("/api/automation/update-status", {
+            method: "POST",
+            body: JSON.stringify({ lead_id: a.lead_id, status })
+          });
+          upd++;
+        }
+      } catch {
+        fail++;
+      }
+    }
+
+    setMsg(msg, `Queued: ${enq}, Advanced: ${upd}${fail ? `, Failed: ${fail}` : ""}.`, fail ? "warning" : "success");
+    await loadLeads();
+  } catch (e) {
+    setMsg(msg, e.message || "Failed to run due actions.", "error");
+  }
 }
 
 // ---------- connection (secure browser + job polling) ----------
@@ -356,7 +477,6 @@ async function loadAccountSettings() {
     const px = s.proxy || {};
     setText($("proxy-status"), px.server ? `Proxy: ${px.server} (${px.username === "saved" ? "auth set" : "no auth"})` : "Proxy: not set");
     setText($("settings-updated-at"), s.updated_at ? `Last updated: ${new Date(s.updated_at).toLocaleString()}` : "");
-    // do not prefill username/password/totp for safety; keep inputs blank
   } catch (e) {
     setMsg($("acct-msg"), e.message || "Failed to load account settings.", "error");
   }
@@ -417,6 +537,7 @@ function showApp() {
   show($("app"));
   switchAppView("leads");
   loadLeads();
+  loadAutomationPrefs(); // safe no-op if fields not present
 }
 
 // ---------- event wiring ----------
@@ -438,11 +559,16 @@ document.addEventListener("DOMContentLoaded", () => {
     checkConnection();
     loadLogs();
     loadAccountSettings();
+    loadAutomationPrefs();
   });
 
   // leads actions
   $("reload-btn")?.addEventListener("click", loadLeads);
   $("download-btn")?.addEventListener("click", downloadExcel);
+
+  // automation prefs/actions (only if controls exist)
+  $("save-prefs-btn")?.addEventListener("click", saveAutomationPrefs);
+  $("run-due-btn")?.addEventListener("click", runDueActions);
 
   // connect flow
   $("connect-start-btn")?.addEventListener("click", startConnectFlow);
