@@ -1,5 +1,6 @@
 // dashboard.js — LinqBridge Dashboard (Leads + Connect + Sprouts-style account settings)
 // + Automation prefs, Start per-lead, Run Due Actions
+// FINAL — preserves existing behavior; adds safe UI wiring (filters/search), tiny UX polish
 
 const API_BASE = ""; // same-origin (served by your backend)
 const LS_TOKEN = "lb_token";
@@ -14,6 +15,8 @@ function setAttr(el, k, v) { if (el) el.setAttribute(k, v); }
 function hasEl(id) { return !!$(id); }
 function val(id) { const el = $(id); return el ? el.value : ""; }
 function setVal(id, v) { const el = $(id); if (el) el.value = v ?? ""; }
+function on(id, ev, fn){ const el=$(id); if(el) el.addEventListener(ev, fn); }
+function debounce(fn, ms=250){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
 
 function setMsg(el, text, type = "info") {
   if (!el) return;
@@ -67,14 +70,9 @@ async function doLogin() {
   const email = $("login-email").value.trim();
   const password = $("login-password").value;
   const msg = $("auth-msg");
-
   if (!email || !password) return setMsg(msg, "Enter email and password.", "error");
-
   try {
-    const data = await api("/login", {
-      method: "POST",
-      body: JSON.stringify({ email, password })
-    });
+    const data = await api("/login", { method: "POST", body: JSON.stringify({ email, password }) });
     localStorage.setItem(LS_TOKEN, data.token);
     localStorage.setItem(LS_EMAIL, data.userEmail);
     setMsg(msg, "Logged in!", "success");
@@ -91,12 +89,8 @@ async function doRegister() {
   const msg = $("auth-msg");
   if (!email || !p1 || !p2) return setMsg(msg, "Fill all fields.", "error");
   if (p1 !== p2) return setMsg(msg, "Passwords do not match.", "error");
-
   try {
-    await api("/register", {
-      method: "POST",
-      body: JSON.stringify({ email, password: p1 })
-    });
+    await api("/register", { method: "POST", body: JSON.stringify({ email, password: p1 }) });
     setMsg(msg, "Account created. You can log in now.", "success");
     switchAuthTab("login");
   } catch (e) {
@@ -146,7 +140,10 @@ async function loadLeads() {
 }
 
 function renderLeadsTable(rows) {
-  const tbody = $("leads-table").querySelector("tbody");
+  const tbl = $("leads-table");
+  if (!tbl) return;
+  const tbody = tbl.querySelector("tbody");
+  if (!tbody) return;
   tbody.innerHTML = "";
   rows.forEach(r => {
     const tr = document.createElement("tr");
@@ -154,9 +151,9 @@ function renderLeadsTable(rows) {
 
     const td = (v) => {
       const t = document.createElement("td");
-      if (typeof v === "string" && v.startsWith("http")) {
+      if (typeof v === "string" && /^https?:\/\//i.test(v)) {
         const a = document.createElement("a");
-        a.href = v; a.target = "_blank"; a.textContent = v;
+        a.href = v; a.target = "_blank"; a.rel = "noreferrer"; a.textContent = v;
         t.appendChild(a);
       } else {
         t.textContent = v ?? "";
@@ -176,7 +173,7 @@ function renderLeadsTable(rows) {
     const actionsTd = document.createElement("td");
     const startBtn = document.createElement("button");
     startBtn.textContent = "Start";
-    startBtn.className = "btn btn-xs";
+    startBtn.className = "btn small";
     startBtn.addEventListener("click", async () => {
       await startAutomationForLead(r);
     });
@@ -206,6 +203,32 @@ async function downloadExcel() {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
+}
+
+// ---------- leads filters/search (non-breaking; runs only if controls exist) ----------
+function applyLeadFilters() {
+  const sQuery = (val("leads-search") || "").trim().toLowerCase();
+  const status = val("leads-status-filter");
+  const camp   = val("leads-campaign-filter");
+
+  let filtered = CURRENT_LEADS.slice();
+
+  if (camp) {
+    filtered = filtered.filter(r => (r.campaign || r.segment || "").toLowerCase() === camp.toLowerCase());
+  }
+  if (status) {
+    filtered = filtered.filter(r => String(r.automation_status || "").toLowerCase() === status.toLowerCase());
+  }
+  if (sQuery) {
+    filtered = filtered.filter(r => {
+      const blob = [
+        r.first_name, r.last_name, r.title, r.organization,
+        r.public_profile_url, r.sales_nav_url, r.profile_url, r.campaign, r.segment
+      ].map(x => (x || "").toString().toLowerCase()).join(" ");
+      return blob.includes(sQuery);
+    });
+  }
+  renderLeadsTable(filtered);
 }
 
 // ---------- automation (prefs, start, run-due) ----------
@@ -243,7 +266,7 @@ async function startAutomationForLead(lead) {
   const msg = $("app-msg");
   clearMsg(msg);
   try {
-    const note = lead.connection_note || ""; // optional; could also prompt user here
+    const note = lead.connection_note || ""; // optional
     await api("/api/automation/start", {
       method: "POST",
       body: JSON.stringify({ lead_ids: [lead.id], note })
@@ -276,7 +299,6 @@ async function runDueActions() {
             body: JSON.stringify({ profileUrl: a.profileUrl, note: a.note || null })
           });
           enq++;
-          // mark status -> connection_sent (schedules next step according to prefs)
           await api("/api/automation/update-status", {
             method: "POST",
             body: JSON.stringify({ lead_id: a.lead_id, status: "connection_sent", action_details: { connection_note_sent: a.note || null } })
@@ -448,7 +470,10 @@ async function checkConnection() {
 }
 
 async function loadLogs() {
-  const tbody = $("logs-table").querySelector("tbody");
+  const tbl = $("logs-table");
+  if (!tbl) return;
+  const tbody = tbl.querySelector("tbody");
+  if (!tbody) return;
   tbody.innerHTML = "";
   try {
     const data = await api("/api/connection/logs?limit=50");
@@ -471,8 +496,10 @@ async function loadAccountSettings() {
   try {
     const r = await api("/api/account/settings");
     const s = r.settings || {};
-    setText($("creds-status"), s.username === "saved" && s.password === "saved" ? "Credentials: saved" :
-      (s.username === "saved" || s.password === "saved" ? "Credentials: partially saved" : "Credentials: not saved"));
+    setText($("creds-status"),
+      s.username === "saved" && s.password === "saved" ? "Credentials: saved" :
+      (s.username === "saved" || s.password === "saved" ? "Credentials: partially saved" : "Credentials: not saved")
+    );
     setText($("totp-status"), s.totp === "saved" ? "TOTP: saved" : "TOTP: not set");
     const px = s.proxy || {};
     setText($("proxy-status"), px.server ? `Proxy: ${px.server} (${px.username === "saved" ? "auth set" : "no auth"})` : "Proxy: not set");
@@ -543,56 +570,67 @@ function showApp() {
 // ---------- event wiring ----------
 document.addEventListener("DOMContentLoaded", () => {
   // auth tab buttons
-  $("tab-login")?.addEventListener("click", () => switchAuthTab("login"));
-  $("tab-register")?.addEventListener("click", () => switchAuthTab("register"));
+  on("tab-login", "click", () => switchAuthTab("login"));
+  on("tab-register", "click", () => switchAuthTab("register"));
 
-  // auth actions
-  $("login-btn")?.addEventListener("click", doLogin);
-  $("register-btn")?.addEventListener("click", doRegister);
-  $("logout-btn")?.addEventListener("click", logout);
+  // auth actions + Enter key support
+  on("login-btn", "click", doLogin);
+  on("register-btn", "click", doRegister);
+  on("login-password", "keydown", (e)=>{ if(e.key==="Enter") doLogin(); });
+  on("reg-password2", "keydown", (e)=>{ if(e.key==="Enter") doRegister(); });
+  on("logout-btn", "click", logout);
 
   // app tab buttons
-  $("app-tab-leads")?.addEventListener("click", () => switchAppView("leads"));
-  $("app-tab-connection")?.addEventListener("click", () => {
+  on("app-tab-leads", "click", () => switchAppView("leads"));
+  on("app-tab-connection", "click", () => {
     switchAppView("connection");
-    // refresh status, logs, and account settings
     checkConnection();
     loadLogs();
     loadAccountSettings();
     loadAutomationPrefs();
-    loadTemplates(); // <-- NEW
+    loadTemplates();
   });
 
   // leads actions
-  $("reload-btn")?.addEventListener("click", loadLeads);
-  $("download-btn")?.addEventListener("click", downloadExcel);
+  on("reload-btn", "click", loadLeads);
+  on("download-btn", "click", downloadExcel);
 
-  // automation prefs/actions (only if controls exist)
-  $("save-prefs-btn")?.addEventListener("click", saveAutomationPrefs);
-  $("run-due-btn")?.addEventListener("click", runDueActions);
+  // filters/search (non-breaking)
+  const applyFiltersDebounced = debounce(applyLeadFilters, 120);
+  on("leads-campaign-filter", "change", applyFiltersDebounced);
+  on("leads-status-filter",   "change", applyFiltersDebounced);
+  on("leads-search",          "input",  applyFiltersDebounced);
+  on("leads-clear-filters",   "click",  () => {
+    setVal("leads-campaign-filter", "");
+    setVal("leads-status-filter", "");
+    setVal("leads-search", "");
+    applyLeadFilters();
+  });
+
+  // automation prefs/actions
+  on("save-prefs-btn", "click", saveAutomationPrefs);
+  on("run-due-btn", "click", runDueActions);
 
   // connect flow
-  $("connect-start-btn")?.addEventListener("click", startConnectFlow);
-  $("connect-test-btn")?.addEventListener("click", testConnectFlow);
+  on("connect-start-btn", "click", startConnectFlow);
+  on("connect-test-btn", "click", testConnectFlow);
 
   // account settings actions
-  $("save-creds-btn")?.addEventListener("click", saveCreds);
-  $("save-totp-btn")?.addEventListener("click", saveTotp);
-  $("save-proxy-btn")?.addEventListener("click", saveProxy);
+  on("save-creds-btn", "click", saveCreds);
+  on("save-totp-btn", "click", saveTotp);
+  on("save-proxy-btn", "click", saveProxy);
 
   // templates actions
-  $("save-template-btn")?.addEventListener("click", saveTemplate);
-  $("clear-template-btn")?.addEventListener("click", clearTemplateForm);
-  $("reload-templates-btn")?.addEventListener("click", loadTemplates);
+  on("save-template-btn", "click", saveTemplate);
+  on("clear-template-btn", "click", clearTemplateForm);
+  on("reload-templates-btn", "click", loadTemplates);
 
-  // logs reload button (hook up the button itself)
-  $("reload-logs-btn")?.addEventListener("click", loadLogs);
+  // logs reload button
+  on("reload-logs-btn", "click", loadLogs);
 
   // prevent empty viewer href
   if (hasEl("open-viewer-link") && !lastViewerUrl) {
-    $("open-viewer-link").addEventListener("click", (e) => {
-      if (!lastViewerUrl) e.preventDefault();
-    });
+    $("open-viewer-link").addEventListener("click", (e) => { if (!lastViewerUrl) e.preventDefault(); });
   }
 
   // autologin if token exists
@@ -604,10 +642,13 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 // ---------- Templates (save / list / delete) ----------
-let currentTemplateId = null; // not strictly needed (we upsert by name), kept for future
+let currentTemplateId = null; // kept for future; upsert by name
 
 function renderTemplatesTable(list) {
-  const tbody = $("templates-table").querySelector("tbody");
+  const tbl = $("templates-table");
+  if (!tbl) return;
+  const tbody = tbl.querySelector("tbody");
+  if (!tbody) return;
   tbody.innerHTML = "";
   list.forEach(t => {
     const tr = document.createElement("tr");

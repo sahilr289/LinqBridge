@@ -7,8 +7,8 @@
   <link rel="stylesheet" href="dashboard.css"/>
 </head>
 <body>
-  <div class="container">
-    <h1>LinqBridge Dashboard</h1>
+  <div class="container dashboard-grid-bg">
+    <h1 class="hi-tech-underline">LinqBridge Dashboard</h1>
 
     <!-- Auth -->
     <div id="auth-card" class="card">
@@ -50,12 +50,62 @@
 
       <!-- Leads view -->
       <div id="view-leads" class="app-view view-active">
-        <div class="toolbar">
+        <!-- Legend / Campaign chips (non-breaking UI aid) -->
+        <div class="row" style="margin-bottom:10px; flex-wrap:wrap; gap:8px;">
+          <span class="pill starters" title="Invite-only; auto +24h check then handover">Journey Starters</span>
+          <span class="pill navigators" title="Message-only to 1st-degree; daily cap respected">Journey Navigators</span>
+          <span class="pill accelerators" title="Message-only (batch-friendly); daily cap respected">Journey Accelerators</span>
+        </div>
+
+        <!-- Quotas (visual only; safe defaults until wired in JS) -->
+        <div class="card" style="margin-bottom:12px;">
+          <div class="stack" style="gap:8px;">
+            <div class="quota" aria-label="Daily invite quota">
+              <div class="label">Invites today</div>
+              <div class="bar"><div id="quota-invites-fill" class="fill" style="width:0%"></div></div>
+              <div class="counter"><span id="quota-invites-used">0</span>/15</div>
+            </div>
+            <div class="quota" aria-label="Daily message quota">
+              <div class="label">Messages today</div>
+              <div class="bar"><div id="quota-messages-fill" class="fill" style="width:0%"></div></div>
+              <div class="counter"><span id="quota-messages-used">0</span>/15</div>
+            </div>
+            <div class="helper">Caps include follow-ups. Worker rests when caps are reached.</div>
+          </div>
+        </div>
+
+        <div class="toolbar" style="flex-wrap:wrap; gap:10px;">
           <div>
             <button id="reload-btn" class="btn">Reload Leads</button>
             <button id="download-btn" class="btn">Download Excel</button>
             <!-- NEW: run scheduler -->
             <button id="run-due-btn" class="btn primary">Run Due Actions</button>
+          </div>
+
+          <!-- Non-breaking filters (optional wiring in dashboard.js) -->
+          <div class="row" style="gap:8px; flex-wrap:wrap;">
+            <select id="leads-campaign-filter" class="campaign-select" aria-label="Filter by campaign" style="max-width:220px;">
+              <option value="">All Campaigns</option>
+              <option value="Journey Starters">Journey Starters</option>
+              <option value="Journey Navigators">Journey Navigators</option>
+              <option value="Journey Accelerators">Journey Accelerators</option>
+            </select>
+            <select id="leads-status-filter" class="campaign-select" aria-label="Filter by status" style="max-width:220px;">
+              <option value="">All Status</option>
+              <option value="scraped">Scraped</option>
+              <option value="pending_connect">Pending Connect</option>
+              <option value="in_progress">In Progress</option>
+              <option value="connection_sent">Connection Sent</option>
+              <option value="accepted">Accepted</option>
+              <option value="msg1_sent">Msg1 Sent</option>
+              <option value="msg2_sent">Msg2 Sent</option>
+              <option value="msg3_sent">Msg3 Sent</option>
+              <option value="replied">Replied</option>
+              <option value="skipped">Skipped</option>
+              <option value="error">Error</option>
+            </select>
+            <input id="leads-search" type="search" class="campaign-select" placeholder="Search name, title, company…" style="max-width:260px;" />
+            <button id="leads-clear-filters" class="btn small">Clear</button>
           </div>
         </div>
 
@@ -75,6 +125,10 @@
           </thead>
           <tbody></tbody>
         </table>
+
+        <p class="helper" style="margin-top:8px;">
+          Tip: Use <span class="code">Run Due Actions</span> after saving your schedule and templates to automatically queue anything due now.
+        </p>
       </div>
 
       <!-- Connect LinkedIn view -->
@@ -244,7 +298,7 @@
             <thead>
               <tr>
                 <th>Type</th>
-                <th>Name</th>
+                <th>Title</th>
                 <th>Preview</th>
                 <th>Actions</th>
               </tr>

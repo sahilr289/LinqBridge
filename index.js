@@ -1,6 +1,11 @@
-// index.js — LinqBridge backend (FINAL with "Sprouts-mode": creds+TOTP+proxy storage, worker fetch)
-// + SerpAPI integration for public LinkedIn URL resolution
-// + User-configurable follow-up schedule & Start Automation
+// index.js — LinqBridge backend (FINAL + Campaigns, Scheduler prefs, Daily caps metrics)
+// Keeps all existing endpoints/flows working. Adds:
+// - Lead.campaign support (Journey Starters / Navigators / Accelerators)
+// - Optional per-lead next_check_at (for acceptance checks timetable)
+// - Scheduler prefs (start_time_ist, window, caps) with GET/POST APIs
+// - Daily usage counters (invites/messages) + worker increment endpoint
+// - Metrics endpoint for “Invites x/15 • Messages y/15 • Window 10:00–22:00 IST”
+// - /jobs/enqueue-acceptance-scan helper (optional; worker may ignore if unimplemented)
 
 const express = require("express");
 const cors = require("cors");
@@ -25,6 +30,16 @@ const SERPAPI_DEBUG = (/^(true|1|yes)$/i).test(process.env.SERPAPI_DEBUG || "fal
 // --- Optional viewer info for Connect flow ---
 const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || "";     // e.g. https://linqbridge-worker-xxxx.up.railway.app
 const NOVNC_PASSWORD  = process.env.NOVNC_PASSWORD  || "changeme123";
+
+// --- Server defaults for Scheduler (can be overridden per user) ---
+const DEFAULT_SCHEDULER = Object.freeze({
+  start_time_ist: "10:00",          // HH:MM (24h) IST
+  active_window_hours: 12,          // 12-hour active window
+  max_invites_per_day: 15,          // daily invites cap
+  max_messages_per_day: 15,         // daily messages cap (incl. followups)
+  followup_reserved_slots: 5,       // out of 15 messages, keep some for followups
+  active_days: "Mon,Tue,Wed,Thu,Fri"// CSV weekdays (labels only; worker enforces)
+});
 
 // --- File-backed Job Queue ---
 const DATA_DIR = path.join(__dirname, "data");
@@ -72,7 +87,7 @@ const ALLOWED_ORIGINS = new Set([
 ]);
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || ALLOWED_ORIGINS.has(origin)) return cb(null, true); // allow curl/postman (no origin)
+    if (!origin || ALLOWED_ORIGINS.has(origin)) return cb(null, true);
     return cb(new Error(`Origin ${origin} not allowed by CORS`));
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -85,6 +100,17 @@ app.options("*", cors());
 const dbPath = path.join(__dirname, "linqbridge.db");
 const LOG_SQL = (/^(true|1|yes)$/i).test(process.env.LOG_SQL || "false");
 const db = new Database(dbPath, LOG_SQL ? { verbose: console.log } : {});
+
+// Schema helpers (safe ALTER ADD COLUMN if missing)
+function columnExists(table, column) {
+  const rows = db.prepare(`PRAGMA table_info(${table});`).all();
+  return rows.some(r => r.name === column);
+}
+function ensureColumn(table, column, type) {
+  if (!columnExists(table, column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type};`);
+  }
+}
 
 function initializeDatabase() {
   db.exec(`
@@ -110,6 +136,10 @@ function initializeDatabase() {
       liked_post_url TEXT
     );
   `);
+
+  // Add new columns (non-breaking)
+  ensureColumn("leads", "campaign", "TEXT");           // STARTERS | NAVIGATORS | ACCELERATORS | null
+  ensureColumn("leads", "next_check_at", "DATETIME");  // optional per-lead acceptance check schedule
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS message_templates (
@@ -145,14 +175,14 @@ function initializeDatabase() {
     CREATE TABLE IF NOT EXISTS connection_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_email TEXT NOT NULL,
-      level TEXT NOT NULL,      -- info | warn | error
-      event TEXT NOT NULL,      -- cookies_saved | status_soft_ok | status_live_ok | status_fail
-      details TEXT,             
+      level TEXT NOT NULL,
+      event TEXT NOT NULL,
+      details TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
   `);
 
-  // NEW: account_settings for Sprouts-mode
+  // Sprouts-mode account settings
   db.exec(`
     CREATE TABLE IF NOT EXISTS account_settings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -167,7 +197,7 @@ function initializeDatabase() {
     );
   `);
 
-  // NEW: user-configurable follow-up schedule (offsets in days)
+  // Automation prefs (offsets)
   db.exec(`
     CREATE TABLE IF NOT EXISTS automation_prefs (
       email TEXT PRIMARY KEY,
@@ -176,6 +206,32 @@ function initializeDatabase() {
       msg2_after_msg1_days INTEGER DEFAULT 4,
       msg3_after_msg2_days INTEGER DEFAULT 7,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  // Scheduler prefs (window & caps)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS scheduler_prefs (
+      email TEXT PRIMARY KEY,
+      start_time_ist TEXT DEFAULT '10:00',
+      active_window_hours INTEGER DEFAULT 12,
+      max_invites_per_day INTEGER DEFAULT 15,
+      max_messages_per_day INTEGER DEFAULT 15,
+      followup_reserved_slots INTEGER DEFAULT 5,
+      active_days TEXT DEFAULT 'Mon,Tue,Wed,Thu,Fri',
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  // Daily usage counters (per BDR per IST day)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS daily_usage (
+      email TEXT NOT NULL,
+      ymd TEXT NOT NULL, -- YYYY-MM-DD in IST
+      invites_used INTEGER DEFAULT 0,
+      messages_used INTEGER DEFAULT 0,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (email, ymd)
     );
   `);
 
@@ -219,7 +275,52 @@ function dec(blob) {
   return decd.toString("utf8");
 }
 
+// --- IST time helpers (no external deps) ---
+const IST_OFFSET_MIN = 330; // +05:30
+function nowIST() {
+  const now = new Date();
+  const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
+  return new Date(utcMs + IST_OFFSET_MIN * 60000);
+}
+function istYMD(d = nowIST()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+function istDateAtTime(ymd, hhmm) {
+  // ymd: YYYY-MM-DD, hhmm: "HH:MM"
+  const [y, m, d] = ymd.split("-").map(Number);
+  const [hh, mm] = (hhmm || "10:00").split(":").map(Number);
+  // Construct IST Date by building UTC then shifting back offset
+  const utcMs = Date.UTC(y, m - 1, d, hh - Math.floor(IST_OFFSET_MIN/60), mm - (IST_OFFSET_MIN % 60));
+  return new Date(utcMs);
+}
+function computeWindow(email) {
+  // Get prefs
+  const row = db.prepare(`
+    SELECT start_time_ist, active_window_hours, max_invites_per_day, max_messages_per_day, followup_reserved_slots, active_days
+    FROM scheduler_prefs WHERE email = ?
+  `).get(email) || {};
+  const prefs = { ...DEFAULT_SCHEDULER, ...row };
+  const now = nowIST();
+  const ymd = istYMD(now);
+  const start = istDateAtTime(ymd, prefs.start_time_ist);
+  const end = new Date(start.getTime() + (prefs.active_window_hours || 12) * 3600000);
+  const isActive = now >= start && now <= end;
+  const nextWake = now <= end ? start : istDateAtTime(istYMD(new Date(now.getTime() + 86400000)), prefs.start_time_ist);
+  return {
+    prefs,
+    now_ist: now.toISOString(),
+    window_start_ist: start.toISOString(),
+    window_end_ist: end.toISOString(),
+    is_active_window: isActive,
+    next_wake_ist: nextWake.toISOString()
+  };
+}
+
 // --- Helpers ---
+async function safeText(res) { try { return await res.text(); } catch { return ""; } }
 function logConn(email, level, event, detailsObj) {
   try {
     db.prepare(`
@@ -281,8 +382,6 @@ async function resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie) {
   }
 }
 
-async function safeText(res) { try { return await res.text(); } catch { return ""; } }
-
 function derivePublicFromSalesNav(salesNavUrl) {
   if (!salesNavUrl) return null;
   const m = salesNavUrl.match(/\/sales\/lead\/([^,\/\?]+)/i);
@@ -290,18 +389,18 @@ function derivePublicFromSalesNav(salesNavUrl) {
   return null;
 }
 
-// ---------------- SerpAPI helpers (ONLY) ----------------
+// ---------------- SerpAPI helpers ----------------
 function cleanNamePart(s) {
   if (!s) return null;
   let x = String(s).trim();
-  x = x.replace(/,.*/, ""); // drop "Brown, CFA" -> "Brown"
+  x = x.replace(/,.*/, "");
   const bad = new Set(["jr","sr","ii","iii","iv","cfa","cpa","frm","aca","acca","ca","mba","msc","ms","bsc","ba","phd","md","esq","pmp","cissp","cism","cisa","csm","safe"]);
   x = x.split(/\s+/).filter(tok => !bad.has(tok.toLowerCase())).join(" ");
   return x.trim() || null;
 }
 const escRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const isLinkedInPublicUrl = (u="") => /linkedin\.com\/in\//i.test(u);
-const isUrnLikePublic = (u="") => /\/in\/AC[a-z0-9_-]{6,}/i.test(u); // many Sales/URN-style "public urls"
+const isUrnLikePublic = (u="") => /\/in\/AC[a-z0-9_-]{6,}/i.test(u);
 
 async function serpapiFindLinkedInUrl({ firstName, lastName, company }) {
   if (!SERPAPI_KEY) return { url: null, step: "serpapi-skip-no-key" };
@@ -316,12 +415,7 @@ async function serpapiFindLinkedInUrl({ firstName, lastName, company }) {
   if (c) qParts.push(`"${c}"`);
   const q = qParts.join(" ");
 
-  const params = new URLSearchParams({
-    engine: "google",
-    q,
-    num: "10",
-    api_key: SERPAPI_KEY,
-  });
+  const params = new URLSearchParams({ engine: "google", q, num: "10", api_key: SERPAPI_KEY });
 
   try {
     const resp = await fetch(`https://serpapi.com/search.json?${params.toString()}`, {
@@ -333,7 +427,6 @@ async function serpapiFindLinkedInUrl({ firstName, lastName, company }) {
 
     let data = {};
     try { data = JSON.parse(text); } catch {}
-
     const rows = (data?.organic_results || [])
       .map(r => ({ link: r?.link, title: r?.title || "", snippet: r?.snippet || "" }))
       .filter(r => r.link && isLinkedInPublicUrl(r.link));
@@ -358,10 +451,10 @@ async function serpapiFindLinkedInUrl({ firstName, lastName, company }) {
 
 /**
  * Unified resolver:
- * 1) If no good public url or looks URN-like, try SerpAPI by name+company
- * 2) If still not found and we have cookies+sales URL, try LinkedIn voyager resolve
- * 3) If still not, derive naive from /sales/lead/{slug}
- * 4) Otherwise keep whatever we already have
+ * 1) SerpAPI by name+company if missing/bad public url
+ * 2) LinkedIn voyager resolve via cookies
+ * 3) Naive derive from /sales/lead/{slug}
+ * 4) Keep existing
  */
 async function findPublicUrlSmart({ firstName, lastName, company, salesNavUrl, existingPublicUrl, liAtCookie }) {
   const steps = [];
@@ -416,6 +509,63 @@ function getAutomationPrefs(email) {
   }
 }
 function addDaysISO(n) { return new Date(Date.now() + n * 86400000).toISOString(); }
+
+// Scheduler prefs helpers
+function getSchedulerPrefs(email) {
+  const row = db.prepare(`
+    SELECT start_time_ist, active_window_hours, max_invites_per_day, max_messages_per_day, followup_reserved_slots, active_days
+    FROM scheduler_prefs WHERE email = ?
+  `).get(email);
+  return { ...DEFAULT_SCHEDULER, ...(row || {}) };
+}
+function setSchedulerPrefs(email, body) {
+  const toInt = (v, d) => {
+    const n = Number.parseInt(v, 10);
+    return Number.isFinite(n) && n >= 0 ? n : d;
+  };
+  const start_time_ist = typeof body.start_time_ist === "string" && /^\d{2}:\d{2}$/.test(body.start_time_ist) ? body.start_time_ist : DEFAULT_SCHEDULER.start_time_ist;
+  const next = {
+    start_time_ist,
+    active_window_hours: toInt(body.active_window_hours, DEFAULT_SCHEDULER.active_window_hours),
+    max_invites_per_day: toInt(body.max_invites_per_day, DEFAULT_SCHEDULER.max_invites_per_day),
+    max_messages_per_day: toInt(body.max_messages_per_day, DEFAULT_SCHEDULER.max_messages_per_day),
+    followup_reserved_slots: toInt(body.followup_reserved_slots, DEFAULT_SCHEDULER.followup_reserved_slots),
+    active_days: typeof body.active_days === "string" ? body.active_days : DEFAULT_SCHEDULER.active_days
+  };
+  db.prepare(`
+    INSERT INTO scheduler_prefs (email, start_time_ist, active_window_hours, max_invites_per_day, max_messages_per_day, followup_reserved_slots, active_days, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(email) DO UPDATE SET
+      start_time_ist=excluded.start_time_ist,
+      active_window_hours=excluded.active_window_hours,
+      max_invites_per_day=excluded.max_invites_per_day,
+      max_messages_per_day=excluded.max_messages_per_day,
+      followup_reserved_slots=excluded.followup_reserved_slots,
+      active_days=excluded.active_days,
+      updated_at=CURRENT_TIMESTAMP
+  `).run(email, next.start_time_ist, next.active_window_hours, next.max_invites_per_day, next.max_messages_per_day, next.followup_reserved_slots, next.active_days);
+  return next;
+}
+
+// Daily usage helpers
+function getOrCreateDailyUsage(email) {
+  const ymd = istYMD();
+  let row = db.prepare(`SELECT email, ymd, invites_used, messages_used FROM daily_usage WHERE email = ? AND ymd = ?`).get(email, ymd);
+  if (!row) {
+    db.prepare(`INSERT INTO daily_usage (email, ymd, invites_used, messages_used, updated_at) VALUES (?, ?, 0, 0, CURRENT_TIMESTAMP)`).run(email, ymd);
+    row = { email, ymd, invites_used: 0, messages_used: 0 };
+  }
+  return row;
+}
+function incrDailyUsage(email, kind, delta = 1) {
+  const ymd = istYMD();
+  getOrCreateDailyUsage(email);
+  if (kind === "invite") {
+    db.prepare(`UPDATE daily_usage SET invites_used = invites_used + ?, updated_at = CURRENT_TIMESTAMP WHERE email = ? AND ymd = ?`).run(delta, email, ymd);
+  } else if (kind === "message") {
+    db.prepare(`UPDATE daily_usage SET messages_used = messages_used + ?, updated_at = CURRENT_TIMESTAMP WHERE email = ? AND ymd = ?`).run(delta, email, ymd);
+  }
+}
 
 // --- Auth Middleware ---
 function authenticateToken(req, res, next) {
@@ -660,7 +810,7 @@ app.post("/jobs/enqueue-send-connection", authenticateToken, async (req, res) =>
   }
 });
 
-// 🆕 NEW: enqueue message job (1st-degree messaging flow)
+// 🆕 enqueue message job (1st-degree messaging flow)
 app.post("/jobs/enqueue-send-message", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
@@ -683,7 +833,7 @@ app.post("/jobs/enqueue-send-message", authenticateToken, async (req, res) => {
         userId: email,
         profileUrl,
         message,
-        cookieBundle // optional; worker also supports creds+totp auth path
+        cookieBundle
       },
       priority,
       status: "queued",
@@ -701,10 +851,46 @@ app.post("/jobs/enqueue-send-message", authenticateToken, async (req, res) => {
   }
 });
 
-// --- Leads upload ---
+// 🆕 Optional: enqueue acceptance scan (bulk)
+app.post("/jobs/enqueue-acceptance-scan", authenticateToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+    const { windowHours = 72, templateText = null, priority = 4 } = req.body || {};
+    const d = await readJobs();
+    const job = {
+      id: uuidv4(),
+      type: "ACCEPTANCE_SCAN",
+      payload: { tenantId: "default", userId: email, windowHours, templateText },
+      priority,
+      status: "queued",
+      enqueuedAt: new Date().toISOString(),
+      attempts: 0,
+      lastError: null,
+    };
+    d.queued.push(job);
+    d.queued.sort((a, b) => a.priority - b.priority);
+    await writeJobs(d);
+    res.json({ ok: true, job });
+  } catch (e) {
+    console.error("enqueue-acceptance-scan error:", e);
+    res.status(500).json({ error: "Failed to enqueue" });
+  }
+});
+
+// --- Leads upload (accepts optional campaign) ---
+function normalizeCampaign(c) {
+  if (!c) return null;
+  const s = String(c).trim().toLowerCase();
+  if (s.startsWith("journey starter")) return "STARTERS";
+  if (s.startsWith("journey navigator")) return "NAVIGATORS";
+  if (s.startsWith("journey accelerator")) return "ACCELERATORS";
+  if (["starters","navigators","accelerators"].includes(s)) return s.toUpperCase();
+  return null;
+}
+
 app.post("/upload-leads", async (req, res) => {
   if (process.env.LOG_UPLOADS === "true") console.log("Received /upload-leads");
-  const { leads, timestamp } = req.body || {};
+  const { leads, timestamp, campaign: bulkCampaign } = req.body || {};
   const userEmail = req.body.userEmail || req.body.email;
   if (!userEmail || !Array.isArray(leads) || leads.length === 0) {
     return res.status(400).json({ success: false, message: "Missing userEmail or leads." });
@@ -716,8 +902,8 @@ app.post("/upload-leads", async (req, res) => {
   const insertLeadSql = `
     INSERT OR IGNORE INTO leads
       (user_email, first_name, last_name, profile_url, public_profile_url, sales_nav_url,
-       organization, title, timestamp, automation_status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+       organization, title, timestamp, automation_status, campaign)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
   `;
   const insertStmt = db.prepare(insertLeadSql);
 
@@ -745,7 +931,6 @@ app.post("/upload-leads", async (req, res) => {
 
       const profileUrlLegacy = rawLead.profile_url || null;
 
-      // NEW: unified find — SerpAPI first, then voyager (cookies), then naive
       const smart = await findPublicUrlSmart({
         firstName, lastName, company: organization,
         salesNavUrl,
@@ -755,11 +940,13 @@ app.post("/upload-leads", async (req, res) => {
 
       const public_profile_url_to_store = smart.url || existingPublic || null;
 
+      const campaignTag = normalizeCampaign(rawLead.campaign) || normalizeCampaign(bulkCampaign) || null;
+
       if (!public_profile_url_to_store && !profileUrlLegacy && !salesNavUrl) { skipped++; return; }
 
       const info = insertStmt.run(
         userEmail, firstName, lastName, profileUrlLegacy, public_profile_url_to_store, salesNavUrl,
-        organization, title, timestamp || new Date().toISOString(), "scraped"
+        organization, title, timestamp || new Date().toISOString(), "scraped", campaignTag
       );
       if (info.changes > 0) inserted++; else skipped++;
     } catch (e) {
@@ -808,6 +995,7 @@ app.get("/download-leads-excel", authenticateToken, async (req, res) => {
     const ws = wb.addWorksheet("Leads Data");
     ws.columns = [
       { header: "User Email", key: "user_email", width: 25 },
+      { header: "Campaign", key: "campaign", width: 18 },
       { header: "First Name", key: "first_name", width: 20 },
       { header: "Last Name", key: "last_name", width: 20 },
       { header: "Organization", key: "organization", width: 30 },
@@ -820,6 +1008,7 @@ app.get("/download-leads-excel", authenticateToken, async (req, res) => {
       { header: "Automation Status", key: "automation_status", width: 20 },
       { header: "Last Action", key: "last_action_timestamp", width: 25 },
       { header: "Next Action Due", key: "next_action_due_date", width: 25 },
+      { header: "Next Check At", key: "next_check_at", width: 25 },
       { header: "Connection Note", key: "connection_note", width: 40 },
       { header: "Follow-up 1", key: "followup_1_message", width: 40 },
       { header: "Follow-up 2", key: "followup_2_message", width: 40 },
@@ -838,6 +1027,7 @@ app.get("/download-leads-excel", authenticateToken, async (req, res) => {
   }
 });
 
+// (Legacy/Current automation helpers kept intact)
 app.get("/api/automation/get-next-leads", authenticateToken, (req, res) => {
   const limit = parseInt(req.query.limit || "1", 10);
   const email = req.user.email;
@@ -899,7 +1089,7 @@ app.get("/api/automation/runner/tick", authenticateToken, (req, res) => {
   }
 });
 
-// 🔧 NEW: save/read user schedule
+// 🔧 NEW: save/read automation offsets (unchanged behavior)
 app.get("/api/automation/prefs", authenticateToken, (req, res) => {
   const prefs = getAutomationPrefs(req.user.email);
   res.json({ ok: true, prefs });
@@ -930,7 +1120,46 @@ app.post("/api/automation/prefs", authenticateToken, (req, res) => {
   res.json({ ok: true, prefs: next });
 });
 
-// 🔧 NEW: Start automation for specified lead IDs (enqueue connection now or schedule later)
+// 🔧 NEW: Scheduler prefs (start time / window / caps)
+app.get("/api/scheduler/prefs", authenticateToken, (req, res) => {
+  const prefs = getSchedulerPrefs(req.user.email);
+  res.json({ ok: true, prefs });
+});
+app.post("/api/scheduler/prefs", authenticateToken, (req, res) => {
+  const next = setSchedulerPrefs(req.user.email, req.body || {});
+  res.json({ ok: true, prefs: next });
+});
+
+// 🔧 NEW: Metrics for today (caps + window + counts)
+app.get("/api/metrics/today", authenticateToken, (req, res) => {
+  const email = req.user.email;
+  const { prefs, now_ist, window_start_ist, window_end_ist, is_active_window, next_wake_ist } = computeWindow(email);
+  const u = getOrCreateDailyUsage(email);
+  res.json({
+    ok: true,
+    now_ist,
+    window: { start_ist: window_start_ist, end_ist: window_end_ist, is_active: is_active_window, next_wake_ist },
+    caps: { invites_per_day: prefs.max_invites_per_day, messages_per_day: prefs.max_messages_per_day, followup_reserved_slots: prefs.followup_reserved_slots },
+    used_today: { invites: u.invites_used, messages: u.messages_used },
+    helper_strip: `Invites ${u.invites}/${prefs.max_invites_per_day} · Messages ${u.messages}/${prefs.max_messages_per_day} (incl. follow-ups) · Window ${prefs.start_time_ist}–${(() => {
+      const [hh,mm]=prefs.start_time_ist.split(":").map(Number);
+      const endH = (hh + (prefs.active_window_hours||12)) % 24;
+      return `${String(endH).padStart(2,"0")}:${mm.toString().padStart(2,"0")} IST`;
+    })()}`
+  });
+});
+
+// 🔧 NEW: Worker increments usage counters (invite/message)
+app.post("/worker/metrics/incr", requireWorkerAuth, (req, res) => {
+  const { userId, kind, delta = 1 } = req.body || {};
+  if (!userId || !["invite","message"].includes(kind)) {
+    return res.status(400).json({ ok: false, error: "userId and kind=invite|message required" });
+  }
+  incrDailyUsage(userId, kind, Number.isFinite(+delta) ? +delta : 1);
+  res.json({ ok: true });
+});
+
+// 🔧 NEW: Start automation for specified lead IDs (kept; unchanged logic)
 app.post("/api/automation/start", authenticateToken, async (req, res) => {
   const email = req.user.email;
   const { lead_ids = [], note = null } = req.body || {};
@@ -986,7 +1215,7 @@ app.post("/api/automation/start", authenticateToken, async (req, res) => {
   res.json({ ok: true, started, queued_now: queuedNow, scheduled });
 });
 
-// 🔧 NEW: status update uses user schedule (no random delays)
+// 🔧 NEW: status update (unchanged; uses offsets)
 app.post("/api/automation/update-status", authenticateToken, (req, res) => {
   const { lead_id, status, action_details = {} } = req.body || {};
   const email = req.user.email;
@@ -999,23 +1228,19 @@ app.post("/api/automation/update-status", authenticateToken, (req, res) => {
   let nextActionDate = null;
   switch (status) {
     case "connection_sent":
-      // wait for acceptance; (optional: you can set a gentle check-in a few days later)
       if (action_details.connection_note_sent) { setClauses.push(`connection_note = ?`); params.push(action_details.connection_note_sent); }
-      nextActionDate = null;
+      nextActionDate = null; // worker schedules acceptance checks separately if desired
       break;
 
     case "accepted":
-      // schedule msg1 after N days
       nextActionDate = addDaysISO(prefs.msg1_after_accept_days);
       break;
 
     case "msg1_sent":
-      // schedule msg2 after M days
       nextActionDate = addDaysISO(prefs.msg2_after_msg1_days);
       break;
 
     case "msg2_sent":
-      // schedule msg3 after K days
       nextActionDate = addDaysISO(prefs.msg3_after_msg2_days);
       break;
 
@@ -1053,7 +1278,7 @@ app.post("/api/automation/update-status", authenticateToken, (req, res) => {
   }
 });
 
-// 🔧 NEW: list actions due now so UI can enqueue corresponding jobs
+// 🔧 NEW: list actions due now (kept intact)
 app.get("/api/automation/get-due-actions", authenticateToken, (req, res) => {
   const email = req.user.email;
   const limit = Math.min(parseInt(req.query.limit || "20", 10), 100);
@@ -1098,7 +1323,7 @@ app.get("/api/automation/get-due-actions", authenticateToken, (req, res) => {
   res.json({ ok: true, actions });
 });
 
-// --- Connection status & logs ---
+// --- Connection status & logs (kept) ---
 const LIVE_CHECK_COOLDOWN_MS = 10 * 60 * 1000;
 
 app.get("/api/connection/check", authenticateToken, async (req, res) => {
@@ -1218,7 +1443,6 @@ app.get("/api/connection/logs", authenticateToken, (req, res) => {
 app.post("/api/connect/start", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
-    // Enqueue AUTH_CHECK for this user. Worker will save storageState per userId=email.
     const d = await readJobs();
     const job = {
       id: uuidv4(),
@@ -1234,7 +1458,6 @@ app.post("/api/connect/start", authenticateToken, async (req, res) => {
     d.queued.sort((a, b) => a.priority - b.priority);
     await writeJobs(d);
 
-    // Compose viewer URL if configured
     const viewerUrl = VIEWER_BASE_URL
       ? `${VIEWER_BASE_URL.replace(/\/+$/,"")}/vnc_lite.html?autoconnect=1&view_only=0&password=${encodeURIComponent(NOVNC_PASSWORD)}`
       : null;
@@ -1281,8 +1504,7 @@ app.post("/api/connect/test", authenticateToken, async (req, res) => {
   }
 });
 
-// --- NEW: Account settings (Sprouts-mode) ---
-// Save LinkedIn creds
+// --- Account settings (Sprouts-mode) ---
 app.post("/api/account/creds", authenticateToken, (req, res) => {
   const email = req.user.email;
   const { username, password } = req.body || {};
@@ -1300,7 +1522,6 @@ app.post("/api/account/creds", authenticateToken, (req, res) => {
   res.json({ ok: true });
 });
 
-// Save TOTP secret
 app.post("/api/account/totp", authenticateToken, (req, res) => {
   const email = req.user.email;
   const { totpSecret } = req.body || {};
@@ -1317,7 +1538,6 @@ app.post("/api/account/totp", authenticateToken, (req, res) => {
   res.json({ ok: true });
 });
 
-// Save proxy
 app.post("/api/account/proxy", authenticateToken, (req, res) => {
   const email = req.user.email;
   const { server, username, password } = req.body || {};
@@ -1375,7 +1595,7 @@ app.get("/worker/account/settings", requireWorkerAuth, (req, res) => {
   });
 });
 
-// ---------- Message Template APIs (create/list/delete) ----------
+// ---------- Message Template APIs ----------
 app.get("/api/templates", authenticateToken, (req, res) => {
   try {
     const rows = db
@@ -1388,7 +1608,6 @@ app.get("/api/templates", authenticateToken, (req, res) => {
   }
 });
 
-// Upsert by (user_email, name) so "Save / Update" just works
 app.post("/api/templates", authenticateToken, (req, res) => {
   const { name, type = "generic", content } = req.body || {};
   if (!name || !content) {
@@ -1422,7 +1641,7 @@ app.delete("/api/templates/:id", authenticateToken, (req, res) => {
   }
 });
 
-// ---------- SerpAPI Browser Tester (place BEFORE root & listen) ----------
+// ---------- SerpAPI Browser Tester ----------
 app.get("/api/dev/serpapi-test", async (req, res) => {
   if (!SERPAPI_KEY) return res.status(500).json({ ok: false, error: "SERPAPI_KEY is not set" });
 
