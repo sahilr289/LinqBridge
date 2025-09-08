@@ -1,5 +1,6 @@
 // index.js — LinqBridge backend (FINAL with "Sprouts-mode": creds+TOTP+proxy storage, worker fetch)
 // + Public URL resolution via SerpAPI (primary), then cookies-based SalesNav, then naive inference.
+// + Name cleaning (e.g., "Brown, CFA" -> "Brown") so SerpAPI works reliably.
 
 const express = require("express");
 const cors = require("cors");
@@ -279,18 +280,49 @@ function derivePublicFromSalesNav(salesNavUrl) {
   return null;
 }
 
-// ---- New: SerpAPI helpers (primary resolver) ----
+// ---- Name & URL cleaning helpers ----
+function cleanNamePart(s) {
+  if (!s) return null;
+  let x = String(s).trim();
+
+  // remove everything after the first comma (e.g., "Brown, CFA" -> "Brown")
+  x = x.replace(/,.*/, "");
+
+  // strip common suffixes/credentials tokens
+  const bad = new Set(["jr", "sr", "ii", "iii", "iv", "cfa", "cpa", "frm", "aca", "acca", "ca", "mba", "msc", "ms", "bsc", "ba", "phd", "md", "esq", "esquire", "pmp", "cissp", "cism", "cisa", "csm", "safe"]);
+  x = x.split(/\s+/).filter(tok => !bad.has(tok.toLowerCase())).join(" ");
+
+  return x.trim() || null;
+}
 function isLinkedInPublicUrl(u = "") { return typeof u === "string" && /linkedin\.com\/in\//i.test(u); }
 function norm(u) { try { return new URL(u).toString(); } catch { return u; } }
+function looksUrnBasedInUrl(u = "") {
+  try {
+    const m = String(u).match(/linkedin\.com\/in\/([^/?#]+)/i);
+    if (!m) return false;
+    return /^AC[a-z0-9_,-]/i.test(m[1]); // e.g., ACwAA...
+  } catch { return false; }
+}
 
+// ---- SerpAPI resolver (primary) ----
 async function serpapiFindLinkedInUrl({ firstName, lastName, company }) {
   if (!SERPAPI_KEY) return { url: null, step: "serpapi-skip-no-key" };
-  const q = [`site:linkedin.com/in`, `"${[firstName, lastName].filter(Boolean).join(" ")}"`];
-  if (company) q.push(company);
+
+  const f = cleanNamePart(firstName);
+  const l = cleanNamePart(lastName);
+  const c = company ? String(company).trim() : "";
+
+  const name = [f, l].filter(Boolean).join(" ").trim();
+  if (!name) return { url: null, step: "serpapi-skip-no-name" };
+
+  const qParts = ['site:linkedin.com/in', `"${name}"`];
+  if (c) qParts.push(`"${c}"`);
+  const q = qParts.join(" ");
+
   const params = new URLSearchParams({
     engine: "google",
-    q: q.join(" "),
-    num: "5",
+    q,
+    num: "10",
     api_key: SERPAPI_KEY,
   });
 
@@ -304,17 +336,69 @@ async function serpapiFindLinkedInUrl({ firstName, lastName, company }) {
 
     let data = {};
     try { data = JSON.parse(text); } catch {}
-    const candidates = []
-      .concat(data?.organic_results || [])
-      .map(r => r?.link)
-      .filter(Boolean);
 
-    const url = candidates.find(isLinkedInPublicUrl);
-    if (url) return { url: norm(url), step: "serpapi-hit" };
-    return { url: null, step: "serpapi-empty", sample: text };
+    // collect top organic links
+    const rows = (data?.organic_results || []).map(r => ({
+      link: r?.link,
+      title: r?.title || "",
+      snippet: r?.snippet || "",
+    })).filter(r => !!r.link && isLinkedInPublicUrl(r.link));
+
+    // prefer a link whose title/snippet includes both first and last (case-insensitive) and maybe company
+    const reName = new RegExp(`\\b${f?.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") || ""}\\b.*\\b${l?.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") || ""}\\b`, "i");
+    const reCo = c ? new RegExp(c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") : null;
+
+    let best = null;
+    for (const r of rows) {
+      const hay = `${r.title} ${r.snippet}`.trim();
+      const nameOk = reName.test(hay);
+      const coOk = reCo ? reCo.test(hay) : true;
+      if (nameOk && coOk) { best = r.link; break; }
+    }
+    const firstLinkedIn = (rows[0] && rows[0].link) || null;
+    const found = norm(best || firstLinkedIn || "");
+
+    if (found) return { url: found, step: "serpapi-hit", query: q };
+    return { url: null, step: "serpapi-empty", query: q, sample: text };
   } catch (e) {
     return { url: null, step: "serpapi-error", error: e.message };
   }
+}
+
+// Unified resolver used by /upload-leads and dev test
+async function findPublicUrlSmart({ firstName, lastName, company, salesNavUrl, existingPublicUrl, title, liAtCookie }) {
+  const steps = [];
+
+  // If we were given a URN-looking public URL (e.g., /in/ACwAA...), try to upgrade it via SerpAPI.
+  const shouldTrySerpFirst = !existingPublicUrl || looksUrnBasedInUrl(existingPublicUrl);
+
+  if (shouldTrySerpFirst) {
+    const sa = await serpapiFindLinkedInUrl({ firstName, lastName, company });
+    steps.push({ step: "serpapi", brief: sa.step || null });
+    if (sa.url) return { url: sa.url, steps, provider: "serpapi" };
+  }
+
+  // Next: cookies-based Sales Nav resolve (if we have li_at and a Sales URL)
+  if (liAtCookie && salesNavUrl) {
+    const resolved = await resolveSalesNavToPublicUrl(salesNavUrl, liAtCookie);
+    steps.push({ step: "voyager-sales-profile", ok: !!resolved });
+    if (resolved) return { url: resolved, steps, provider: "linkedin-cookies" };
+  }
+
+  // Final: naive inference from /sales/lead/<slug>
+  if (salesNavUrl && salesNavUrl.includes("/sales/lead/")) {
+    const infer = derivePublicFromSalesNav(salesNavUrl);
+    steps.push({ step: "derive-sales-lead-slug", ok: !!infer });
+    if (infer) return { url: infer, steps, provider: "naive-derive" };
+  }
+
+  // If we were given an existing public url and didn't improve it, use it.
+  if (existingPublicUrl) {
+    steps.push({ step: "keep-existing-public-url", ok: true });
+    return { url: existingPublicUrl, steps, provider: "existing" };
+  }
+
+  return { url: null, steps, provider: "none" };
 }
 
 // --- Auth Middleware ---
@@ -602,7 +686,9 @@ app.post("/jobs/enqueue-send-message", authenticateToken, async (req, res) => {
 });
 
 // --- Leads upload ---
-// NOW: Try SerpAPI first to resolve public LinkedIn URL; if not found, fall back to cookies + naive inference.
+// NOW: Try SerpAPI first (with cleaned names) to resolve a canonical LinkedIn URL.
+// If the incoming "public_linkedin_url" looks like /in/ACwAA..., we still try to upgrade it.
+// Then fall back to cookies + naive inference.
 app.post("/upload-leads", async (req, res) => {
   if (process.env.LOG_UPLOADS === "true") console.log("Received /upload-leads");
   const { leads, timestamp } = req.body || {};
@@ -630,12 +716,13 @@ app.post("/upload-leads", async (req, res) => {
 
   async function processOne(rawLead) {
     try {
-      const firstName = rawLead.first_name || null;
-      const lastName  = rawLead.last_name || null;
+      // Normalize input
+      const firstName = cleanNamePart(rawLead.first_name || rawLead.first || null);
+      const lastName  = cleanNamePart(rawLead.last_name  || rawLead.last  || null);
       const organization = rawLead.company || rawLead.organization || null;
       const title = rawLead.title || null;
 
-      let publicUrl = (rawLead.public_linkedin_url && rawLead.public_linkedin_url !== "N/A")
+      let providedPublic = (rawLead.public_linkedin_url && rawLead.public_linkedin_url !== "N/A")
         ? rawLead.public_linkedin_url
         : null;
 
@@ -646,19 +733,26 @@ app.post("/upload-leads", async (req, res) => {
 
       const profileUrlLegacy = rawLead.profile_url || null;
 
-      // --- NEW: Try SerpAPI first if no public URL yet ---
-      if (!publicUrl) {
+      let publicUrl = null;
+
+      // 1) SerpAPI (primary) — also upgrade URN-looking "public_linkedin_url"
+      if (!providedPublic || looksUrnBasedInUrl(providedPublic)) {
         const ser = await serpapiFindLinkedInUrl({ firstName, lastName, company: organization });
         if (process.env.LOG_UPLOADS === "true") console.log("[serpapi]", { firstName, lastName, organization, step: ser.step, found: ser.url || null });
         if (ser.url) publicUrl = ser.url;
       }
 
-      // Fall back to your existing cookie-based Sales Navigator resolver
+      // If SerpAPI didn't find anything, but we were given a public URL (even if URN-like), keep it for now.
+      if (!publicUrl && providedPublic) {
+        publicUrl = providedPublic;
+      }
+
+      // 2) Fall back to cookies-based Sales Navigator resolver
       if (!publicUrl && salesNavUrl && liAt) {
         publicUrl = await resolveSalesNavToPublicUrl(salesNavUrl, liAt);
       }
 
-      // Final fallback: naive inference from /sales/lead/<slug>
+      // 3) Final fallback: naive inference from /sales/lead/<slug>
       let inferredPublic = null;
       if (!publicUrl && salesNavUrl && salesNavUrl.includes("/sales/lead/")) {
         inferredPublic = derivePublicFromSalesNav(salesNavUrl);
@@ -1136,24 +1230,39 @@ app.get("/worker/account/settings", requireWorkerAuth, (req, res) => {
   });
 });
 
-// --- Dev: test resolver from the browser (kept the same path name you used) ---
+// --- Dev: test resolver from the browser (with optional debug) ---
 // Example:
-//   /api/dev/rapidapi-test?first=Adam&last=Selipsky&company=Amazon
+//   /api/dev/rapidapi-test?first=Grant&last=Brown&company=Northern%20Trust%20Corporation
+//   /api/dev/rapidapi-test?first=Grant&last=Brown%2C%20CFA&company=Northern%20Trust%20Corporation&debug=1
 app.get("/api/dev/rapidapi-test", async (req, res) => {
   try {
-    const first = (req.query.first || "").trim();
-    const last  = (req.query.last  || "").trim();
+    const first   = (req.query.first   || "").trim();
+    const last    = (req.query.last    || "").trim();
     const company = (req.query.company || "").trim();
+    const debug   = req.query.debug === "1";
+    const started = Date.now();
 
-    const ser = await serpapiFindLinkedInUrl({ firstName: first, lastName: last, company });
-    const found = ser.url || null;
-    res.json({
-      ok: true,
-      found,
-      provider: found ? "serpapi" : "none",
-      strategy: "serpapi-first",
-      step: ser.step || null
+    const { url, steps, provider } = await findPublicUrlSmart({
+      firstName: first, lastName: last, company,
+      salesNavUrl: null,
+      existingPublicUrl: null,
+      title: null,
+      liAtCookie: null,
     });
+
+    const out = {
+      ok: true,
+      found: url || null,
+      provider: provider || "none",
+      strategy: "serpapi-first",
+      ms: Date.now() - started
+    };
+
+    if (debug) {
+      out.debug = { steps, SERPAPI_KEY_loaded: !!SERPAPI_KEY };
+    }
+
+    res.json(out);
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
