@@ -560,6 +560,7 @@ document.addEventListener("DOMContentLoaded", () => {
     loadLogs();
     loadAccountSettings();
     loadAutomationPrefs();
+    loadTemplates(); // <-- NEW
   });
 
   // leads actions
@@ -579,6 +580,14 @@ document.addEventListener("DOMContentLoaded", () => {
   $("save-totp-btn")?.addEventListener("click", saveTotp);
   $("save-proxy-btn")?.addEventListener("click", saveProxy);
 
+  // templates actions
+  $("save-template-btn")?.addEventListener("click", saveTemplate);
+  $("clear-template-btn")?.addEventListener("click", clearTemplateForm);
+  $("reload-templates-btn")?.addEventListener("click", loadTemplates);
+
+  // logs reload button (hook up the button itself)
+  $("reload-logs-btn")?.addEventListener("click", loadLogs);
+
   // prevent empty viewer href
   if (hasEl("open-viewer-link") && !lastViewerUrl) {
     $("open-viewer-link").addEventListener("click", (e) => {
@@ -593,3 +602,104 @@ document.addEventListener("DOMContentLoaded", () => {
     show($("auth-card"));
   }
 });
+
+// ---------- Templates (save / list / delete) ----------
+let currentTemplateId = null; // not strictly needed (we upsert by name), kept for future
+
+function renderTemplatesTable(list) {
+  const tbody = $("templates-table").querySelector("tbody");
+  tbody.innerHTML = "";
+  list.forEach(t => {
+    const tr = document.createElement("tr");
+    const td = (v) => { const el = document.createElement("td"); el.textContent = v ?? ""; return el; };
+
+    const preview = (t.content || "").replace(/\s+/g, " ").slice(0, 120) + ((t.content || "").length > 120 ? "…" : "");
+
+    tr.appendChild(td(t.type || ""));
+    tr.appendChild(td(t.name || ""));
+    tr.appendChild(td(preview));
+
+    const actions = document.createElement("td");
+    const eBtn = document.createElement("button");
+    eBtn.className = "btn small";
+    eBtn.textContent = "Edit";
+    eBtn.onclick = () => editTemplateRow(t);
+
+    const dBtn = document.createElement("button");
+    dBtn.className = "btn small danger";
+    dBtn.textContent = "Delete";
+    dBtn.onclick = () => deleteTemplate(t.id);
+
+    actions.appendChild(eBtn);
+    actions.appendChild(dBtn);
+    tr.appendChild(actions);
+
+    tbody.appendChild(tr);
+  });
+}
+
+async function loadTemplates() {
+  const msg = $("tmpl-msg");
+  clearMsg(msg);
+  try {
+    const r = await api("/api/templates");
+    renderTemplatesTable(r.templates || []);
+  } catch (e) {
+    setMsg(msg, e.message || "Failed to load templates.", "error");
+  }
+}
+
+function editTemplateRow(t) {
+  currentTemplateId = t.id;
+  setVal("template-name", t.name || "");
+  setVal("template-content", t.content || "");
+  const sel = $("template-type");
+  if (sel) sel.value = t.type || "generic";
+  setText($("template-form-hint"), `Editing "${t.name}" (Save/Update overwrites by name)`);
+}
+
+function clearTemplateForm() {
+  currentTemplateId = null;
+  setVal("template-name", "");
+  setVal("template-content", "");
+  const sel = $("template-type"); if (sel) sel.value = "connection_note";
+  setText($("template-form-hint"), "");
+}
+
+async function saveTemplate() {
+  const msg = $("tmpl-msg");
+  clearMsg(msg);
+
+  const name = val("template-name").trim();
+  const content = val("template-content").trim();
+  const type = ($("template-type")?.value) || "generic";
+
+  if (!name || !content) {
+    return setMsg(msg, "Enter a template name and content.", "error");
+  }
+  try {
+    await api("/api/templates", {
+      method: "POST",
+      body: JSON.stringify({ name, type, content })
+    });
+    setMsg(msg, "Template saved.", "success");
+    clearTemplateForm();
+    await loadTemplates();
+  } catch (e) {
+    setMsg(msg, e.message || "Failed to save template.", "error");
+  }
+}
+
+async function deleteTemplate(id) {
+  const msg = $("tmpl-msg");
+  clearMsg(msg);
+  if (!confirm("Delete this template?")) return;
+  try {
+    await api(`/api/templates/${id}`, { method: "DELETE" });
+    setMsg(msg, "Template deleted.", "success");
+    if (currentTemplateId === id) clearTemplateForm();
+    await loadTemplates();
+  } catch (e) {
+    setMsg(msg, e.message || "Failed to delete template.", "error");
+  }
+}

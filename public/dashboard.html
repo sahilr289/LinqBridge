@@ -201,6 +201,58 @@
           </p>
         </div>
 
+        <!-- Message Templates (save reusable connection notes & follow-ups) -->
+        <div class="section">
+          <h3>Message Templates</h3>
+          <p class="help">
+            Save reusable templates for connection notes and follow-ups. You can use tokens like
+            <span class="code">{{first_name}}</span>, <span class="code">{{last_name}}</span>,
+            <span class="code">{{company}}</span>, <span class="code">{{title}}</span>.
+          </p>
+
+          <div id="tmpl-msg" class="msg" style="display:none;"></div>
+
+          <div class="grid-2" style="margin-top:8px;">
+            <div class="stack">
+              <label class="help">Type</label>
+              <select id="template-type">
+                <option value="connection_note">Connection note</option>
+                <option value="msg1">Follow-up 1</option>
+                <option value="msg2">Follow-up 2</option>
+                <option value="msg3">Follow-up 3</option>
+              </select>
+            </div>
+            <div class="stack">
+              <label class="help">Template name</label>
+              <input id="template-name" type="text" placeholder="e.g. Warm intro v1"/>
+            </div>
+          </div>
+
+          <div class="stack" style="margin-top:8px;">
+            <label class="help">Content</label>
+            <textarea id="template-content" rows="6" placeholder="Hi {{first_name}} — great to connect! ..."></textarea>
+          </div>
+
+          <div class="row" style="margin-top:8px;">
+            <button id="save-template-btn" class="btn primary">Save / Update</button>
+            <button id="clear-template-btn" class="btn">Clear</button>
+            <button id="reload-templates-btn" class="btn">Reload</button>
+            <span id="template-form-hint" class="help"></span>
+          </div>
+
+          <table id="templates-table" style="width:100%; margin-top:10px;">
+            <thead>
+              <tr>
+                <th>Type</th>
+                <th>Name</th>
+                <th>Preview</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
         <div class="section">
           <h3>Recent connection logs</h3>
           <div class="row" style="margin-bottom:8px;">

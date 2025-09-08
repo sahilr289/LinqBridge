@@ -1375,6 +1375,53 @@ app.get("/worker/account/settings", requireWorkerAuth, (req, res) => {
   });
 });
 
+// ---------- Message Template APIs (create/list/delete) ----------
+app.get("/api/templates", authenticateToken, (req, res) => {
+  try {
+    const rows = db
+      .prepare("SELECT id, name, type, content FROM message_templates WHERE user_email = ? ORDER BY name ASC")
+      .all(req.user.email);
+    res.json({ ok: true, templates: rows });
+  } catch (e) {
+    console.error("/api/templates GET error:", e);
+    res.status(500).json({ ok: false, error: "Failed to load templates." });
+  }
+});
+
+// Upsert by (user_email, name) so "Save / Update" just works
+app.post("/api/templates", authenticateToken, (req, res) => {
+  const { name, type = "generic", content } = req.body || {};
+  if (!name || !content) {
+    return res.status(400).json({ ok: false, error: "name and content are required" });
+  }
+  try {
+    db.prepare(`
+      INSERT INTO message_templates (user_email, type, name, content)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(user_email, name) DO UPDATE SET
+        type = excluded.type,
+        content = excluded.content
+    `).run(req.user.email, type, name, content);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("/api/templates POST error:", e);
+    res.status(500).json({ ok: false, error: "Failed to save template." });
+  }
+});
+
+app.delete("/api/templates/:id", authenticateToken, (req, res) => {
+  try {
+    const info = db
+      .prepare("DELETE FROM message_templates WHERE id = ? AND user_email = ?")
+      .run(req.params.id, req.user.email);
+    if (!info.changes) return res.status(404).json({ ok: false, error: "Template not found." });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("/api/templates DELETE error:", e);
+    res.status(500).json({ ok: false, error: "Failed to delete template." });
+  }
+});
+
 // ---------- SerpAPI Browser Tester (place BEFORE root & listen) ----------
 app.get("/api/dev/serpapi-test", async (req, res) => {
   if (!SERPAPI_KEY) return res.status(500).json({ ok: false, error: "SERPAPI_KEY is not set" });
